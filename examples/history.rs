@@ -1,3 +1,5 @@
+#![feature(nll)]
+
 extern crate futures;
 extern crate resp_async;
 extern crate tokio;
@@ -12,14 +14,16 @@ use tokio::prelude::*;
 use resp_async::*;
 
 fn process(
-    peer: &mut PeerContext,
+    peer: &mut PeerContext<i32>,
     request: Value,
 ) -> impl IntoFuture<Future = FutureResult<Value, io::Error>, Item = Value, Error = io::Error> {
-    if !peer.contains_key("history") {
-        peer.set("history", Value::Array(vec![Clone::clone(&request)]));
-    } else if let Some(Value::Array(history)) = peer.get_mut("history") {
-        history.push(request);
+    let value = vec![peer.user_data.into(), request].into();
+    if let Some(Value::Array(history)) = peer.get_mut("history") {
+        history.push(value);
+    } else {
+        peer.set("history", vec![value].into());
     }
+    peer.user_data += 1;
     Ok(Clone::clone(peer.get("history").unwrap()))
 }
 

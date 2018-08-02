@@ -65,16 +65,23 @@ macro_rules! or {
 }
 
 #[derive(Debug)]
-pub struct PeerContext {
+pub struct PeerContext<T>
+where
+    T: Default,
+{
     peer: SocketAddr,
     local: SocketAddr,
     ctx: HashMap<String, Value>,
+    pub user_data: T,
 }
 
-impl PeerContext {
-    pub fn set<T>(&mut self, key: T, value: Value) -> Option<Value>
+impl<T> PeerContext<T>
+where
+    T: Default,
+{
+    pub fn set<K>(&mut self, key: K, value: Value) -> Option<Value>
     where
-        T: Into<String>,
+        K: Into<String>,
     {
         self.ctx.insert(key.into(), value)
     }
@@ -100,15 +107,17 @@ impl PeerContext {
     }
 }
 
-fn process<F, U>(socket: TcpStream, f: F) -> impl Future<Item = (), Error = Error>
+fn process<F, U, T>(socket: TcpStream, f: F) -> impl Future<Item = (), Error = Error>
 where
-    F: Fn(&mut PeerContext, Value) -> U,
+    F: Fn(&mut PeerContext<T>, Value) -> U,
     U: IntoFuture<Item = Value, Error = Error> + Send + Sync,
+    T: Default,
 {
     let mut client = PeerContext {
         peer: try_result!(socket.peer_addr()),
         local: try_result!(socket.local_addr()),
         ctx: HashMap::new(),
+        user_data: T::default(),
     };
     let (tx, rx) = ValueCodec::default().framed(socket).split();
     // Map all requests into responses and send them back to the client.
@@ -117,10 +126,11 @@ where
         .and_then(|_res| Ok(())))
 }
 
-pub fn listen_and_serve<F, U>(addr: &SocketAddr, f: F) -> impl Future<Item = (), Error = Error>
+pub fn listen_and_serve<F, U, T>(addr: &SocketAddr, f: F) -> impl Future<Item = (), Error = Error>
 where
-    F: Fn(&mut PeerContext, Value) -> U + Clone,
+    F: Fn(&mut PeerContext<T>, Value) -> U + Clone,
     U: IntoFuture<Item = Value, Error = Error> + Send + Sync,
+    T: Default,
 {
     or!(try_result!(TcpListener::bind(&addr))
         .incoming()

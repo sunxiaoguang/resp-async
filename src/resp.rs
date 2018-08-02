@@ -122,6 +122,27 @@ impl From<u64> for Value {
     }
 }
 
+impl From<Vec<u8>> for Value {
+    fn from(b: Vec<u8>) -> Self {
+        Value::Bulk(b)
+    }
+}
+
+impl From<Option<Vec<u8>>> for Value {
+    fn from(b: Option<Vec<u8>>) -> Self {
+        match b {
+            Some(b) => Value::Bulk(b),
+            None => Value::Null,
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for Value where T: Into<Value> {
+    fn from(a: Vec<T>) -> Self {
+        Value::Array(a.into_iter().map(Into::into).collect())
+    }
+}
+
 pub struct ValueEncoder;
 
 impl ValueEncoder {
