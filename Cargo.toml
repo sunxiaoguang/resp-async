@@ -1,7 +1,7 @@
 [package]
 name = "resp-async"
 description = "Asynchronous Redis protocol parser"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["Xiaoguang Sun <sunxiaoguang@gmail.com>"]
 repository = "https://github.com/sunxiaoguang/resp-async"
 license = "BSD-3-Clause"
@@ -11,3 +11,7 @@ bytes = "0.4"
 futures = "0.1"
 tokio = "0.1"
 tokio-codec = "0.1"
+log = "0.4"
+
+[dev-dependencies]
+simplelog = "0.5"

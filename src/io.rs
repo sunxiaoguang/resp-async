@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::mem;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::BytesMut;
-use futures::{Future, Sink, Stream};
+use futures::{future, Future, Sink, Stream};
+use tokio;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
 use tokio_codec::{Decoder, Encoder};
 
 use error::*;
@@ -46,7 +48,7 @@ impl Encoder for ValueCodec {
     }
 }
 
-macro_rules! try_result {
+macro_rules! either {
     ($expr:expr) => {
         match $expr {
             Ok(val) => val,
@@ -107,32 +109,92 @@ where
     }
 }
 
-fn process<F, U, T>(socket: TcpStream, f: F) -> impl Future<Item = (), Error = Error>
-where
-    F: Fn(&mut PeerContext<T>, Value) -> U,
-    U: IntoFuture<Item = Value, Error = Error> + Send + Sync,
-    T: Default,
-{
-    let mut client = PeerContext {
-        peer: try_result!(socket.peer_addr()),
-        local: try_result!(socket.local_addr()),
-        ctx: HashMap::new(),
-        user_data: T::default(),
-    };
-    let (tx, rx) = ValueCodec::default().framed(socket).split();
-    // Map all requests into responses and send them back to the client.
-    or!(tx
-        .send_all(rx.and_then(move |v| f(&mut client, v)))
-        .and_then(|_res| Ok(())))
+pub trait EventHandler {
+    type ClientUserData: Default + Send + Sync;
+
+    fn on_request(
+        &self,
+        peer: &mut PeerContext<Self::ClientUserData>,
+        request: Value,
+    ) -> Box<Future<Item = Value, Error = Error> + Send + Sync>;
+    fn on_connect(&self, _id: u64) -> Result<Self::ClientUserData> {
+        Ok(Self::ClientUserData::default())
+    }
+    fn on_disconnect(&self, _id: u64) {}
 }
 
-pub fn listen_and_serve<F, U, T>(addr: &SocketAddr, f: F) -> impl Future<Item = (), Error = Error>
+pub struct Server<H>
 where
-    F: Fn(&mut PeerContext<T>, Value) -> U + Clone,
-    U: IntoFuture<Item = Value, Error = Error> + Send + Sync,
-    T: Default,
+    H: EventHandler + Send + Sync + 'static,
 {
-    or!(try_result!(TcpListener::bind(&addr))
-        .incoming()
-        .for_each(move |socket| process(socket, f.clone())))
+    handler: Arc<H>,
+    addresses: Vec<TcpListener>,
+    client_id: Arc<AtomicU64>,
+}
+
+impl<H> Server<H>
+where
+    H: EventHandler + Send + Sync + 'static,
+{
+    pub fn new(handler: H) -> Self {
+        Server {
+            handler: Arc::new(handler),
+            addresses: Vec::with_capacity(1),
+            client_id: Arc::new(AtomicU64::default()),
+        }
+    }
+
+    pub fn listen(&mut self, addr: &SocketAddr) -> Result<&mut Self> {
+        self.addresses.push(TcpListener::bind(addr)?);
+        Ok(self)
+    }
+
+    fn try_process(
+        id: u64,
+        handler: Arc<H>,
+        socket: TcpStream,
+    ) -> impl Future<Item = (), Error = Error> {
+        let user_data = either!(handler.on_connect(id));
+        let mut client = PeerContext {
+            peer: either!(socket.peer_addr()),
+            local: either!(socket.local_addr()),
+            ctx: HashMap::new(),
+            user_data,
+        };
+        let (tx, rx) = ValueCodec::default().framed(socket).split();
+        let disconnect_handler = Arc::clone(&handler);
+        or!(tx
+            .send_all(rx.and_then(move |v| handler.on_request(&mut client, v)))
+            .then(move |r| {
+                disconnect_handler.on_disconnect(id);
+                r.map(|_| ())
+            }))
+    }
+
+    fn process(id: u64, handler: Arc<H>, socket: TcpStream) -> impl Future<Item = (), Error = ()> {
+        Self::try_process(id, handler, socket)
+            .map_err(move |e| warn!("Failed to handle connection: {}", e))
+    }
+
+    pub fn serve(&mut self) -> Result<()> {
+        let addresses: Vec<TcpListener> = self.addresses.drain(..).collect();
+        let handler = Arc::clone(&self.handler);
+        let client_id = Arc::clone(&self.client_id);
+        tokio::run(
+            future::join_all(addresses.into_iter().map(move |l| {
+                let handler = Arc::clone(&handler);
+                let client_id = Arc::clone(&client_id);
+                l.incoming()
+                    .map_err(|e| warn!("Failed to accept connection: {}", e))
+                    .for_each(move |socket| {
+                        tokio::spawn(Self::process(
+                            client_id.fetch_add(1, Ordering::AcqRel),
+                            Arc::clone(&handler),
+                            socket,
+                        ))
+                    })
+            })).map(|_| ()),
+        );
+        Ok(())
+    }
 }

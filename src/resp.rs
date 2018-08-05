@@ -137,7 +137,10 @@ impl From<Option<Vec<u8>>> for Value {
     }
 }
 
-impl<T> From<Vec<T>> for Value where T: Into<Value> {
+impl<T> From<Vec<T>> for Value
+where
+    T: Into<Value>,
+{
     fn from(a: Vec<T>) -> Self {
         Value::Array(a.into_iter().map(Into::into).collect())
     }
