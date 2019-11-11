@@ -1,4 +1,3 @@
-#![feature(nll)]
 extern crate futures;
 extern crate resp_async;
 extern crate tokio;
@@ -30,7 +29,7 @@ impl EventHandler for HistoryServer {
         &self,
         peer: &mut PeerContext<Self::ClientUserData>,
         request: Value,
-    ) -> Box<Future<Item = Value, Error = Error> + Send + Sync> {
+    ) -> Box<dyn Future<Item = Value, Error = Error> + Send + Sync> {
         let value = vec![peer.user_data.into(), request].into();
         if let Some(Value::Array(history)) = peer.get_mut("history") {
             history.push(value);

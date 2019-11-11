@@ -1,4 +1,4 @@
-use std::convert::{From, TryInto};
+use std::convert::{From, TryFrom};
 use std::{mem, str};
 
 use bytes::{BufMut, BytesMut};
@@ -19,76 +19,52 @@ fn inconvertible<A>(from: &Value, target: &str) -> Result<A> {
     invalid_data(format!("'{:?}' is not convertible to '{}'", from, target))
 }
 
-impl TryInto<String> for Value {
+impl TryFrom<Value> for String {
     type Error = Error;
 
-    fn try_into(self) -> Result<String> {
-        match self {
+    fn try_from(val: Value) -> Result<String> {
+        match val {
             Value::Bulk(b) => Ok(String::from_utf8(b).map_err(to_error)?),
             Value::Integer(i) => Ok(i.to_string()),
             Value::String(s) => Ok(s),
-            _ => inconvertible(&self, "String"),
+            _ => inconvertible(&val, "String"),
         }
     }
 }
 
-impl Into<String> for Value {
-    fn into(self) -> String {
-        self.try_into().unwrap()
-    }
-}
-
-impl TryInto<Vec<u8>> for Value {
+impl TryFrom<Value> for Vec<u8> {
     type Error = Error;
 
-    fn try_into(self) -> Result<Vec<u8>> {
-        if let Value::Bulk(b) = self {
+    fn try_from(val: Value) -> Result<Vec<u8>> {
+        if let Value::Bulk(b) = val {
             Ok(b)
         } else {
-            inconvertible(&self, "Vec<u8>")
+            inconvertible(&val, "Vec<u8>")
         }
     }
 }
 
-impl Into<Vec<u8>> for Value {
-    fn into(self) -> Vec<u8> {
-        self.try_into().unwrap()
-    }
-}
-
-impl TryInto<i64> for Value {
+impl TryFrom<Value> for i64 {
     type Error = Error;
 
-    fn try_into(self) -> Result<i64> {
-        if let Value::Integer(i) = self {
+    fn try_from(val: Value) -> Result<i64> {
+        if let Value::Integer(i) = val {
             Ok(i)
         } else {
-            inconvertible(&self, "i64")
+            inconvertible(&val, "i64")
         }
     }
 }
 
-impl Into<i64> for Value {
-    fn into(self) -> i64 {
-        self.try_into().unwrap()
-    }
-}
-
-impl TryInto<Option<Vec<u8>>> for Value {
+impl TryFrom<Value> for Option<Vec<u8>> {
     type Error = Error;
 
-    fn try_into(self) -> Result<Option<Vec<u8>>> {
-        match self {
+    fn try_from(val: Value) -> Result<Option<Vec<u8>>> {
+        match val {
             Value::Bulk(b) => Ok(Some(b)),
             Value::Null => Ok(None),
-            _ => inconvertible(&self, "Option<Vec<u8>>"),
+            _ => inconvertible(&val, "Option<Vec<u8>>"),
         }
-    }
-}
-
-impl Into<Option<Vec<u8>>> for Value {
-    fn into(self) -> Option<Vec<u8>> {
-        self.try_into().unwrap()
     }
 }
 
@@ -428,7 +404,7 @@ impl IntegerDecoder {
             let inspect = self.inspect;
             self.inspect += 1;
             match (self.expect_lf, input[inspect]) {
-                (false, b'0'...b'9') => (),
+                (false, b'0'..=b'9') => (),
                 (false, b'-') => (),
                 (false, b'\r') => self.expect_lf = true,
                 (true, b'\n') => return self.decode(input).map(Some),

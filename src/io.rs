@@ -116,7 +116,7 @@ pub trait EventHandler {
         &self,
         peer: &mut PeerContext<Self::ClientUserData>,
         request: Value,
-    ) -> Box<Future<Item = Value, Error = Error> + Send + Sync>;
+    ) -> Box<dyn Future<Item = Value, Error = Error> + Send + Sync>;
     fn on_connect(&self, _id: u64) -> Result<Self::ClientUserData> {
         Ok(Self::ClientUserData::default())
     }
@@ -193,7 +193,8 @@ where
                             socket,
                         ))
                     })
-            })).map(|_| ()),
+            }))
+            .map(|_| ()),
         );
         Ok(())
     }

@@ -1,5 +1,4 @@
 #![recursion_limit = "1024"]
-#![feature(try_from, nll, integer_atomics)]
 extern crate bytes;
 extern crate futures;
 #[macro_use]
