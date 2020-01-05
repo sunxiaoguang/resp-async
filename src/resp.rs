@@ -3,7 +3,7 @@ use std::{mem, str};
 
 use bytes::{BufMut, BytesMut};
 
-use error::{invalid_data, to_error, Error, Result};
+use crate::error::{invalid_data, to_error, Error, Result};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Value {

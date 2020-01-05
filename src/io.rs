@@ -10,8 +10,8 @@ use tokio;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_codec::{Decoder, Encoder};
 
-use error::*;
-use resp::*;
+use crate::error::*;
+use crate::resp::*;
 
 #[derive(Default)]
 struct ValueCodec {
