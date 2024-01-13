@@ -219,7 +219,7 @@ where
             _ = shutdown => {
                 info!("shutting down server");
             }
-        };
+        }
 
         drop(notify_shutdown);
         drop(shutdown_complete_tx);
