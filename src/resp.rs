@@ -1,7 +1,7 @@
 use std::convert::{From, TryFrom};
-use std::{mem, str};
+use std::str;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::{invalid_data, to_error, Error, Result};
 
@@ -13,6 +13,12 @@ pub enum Value {
     Bulk(Vec<u8>),
     Null,
     Array(Vec<Value>),
+}
+
+impl Value {
+    pub(crate) fn encode(&self, buf: &mut BytesMut) {
+        ValueEncoder::encode(buf, self);
+    }
 }
 
 fn inconvertible<A>(from: &Value, target: &str) -> Result<A> {
@@ -198,9 +204,9 @@ impl ValueEncoder {
                 }
             }
             Value::Integer(i) => Self::write_header(buf, b':', *i),
-            Value::Bulk(b) => Self::write_bulk(buf, b'$', &b),
-            Value::String(s) => Self::write_string(buf, b'+', &s),
-            Value::Error(e) => Self::write_string(buf, b'-', &e),
+            Value::Bulk(b) => Self::write_bulk(buf, b'$', b),
+            Value::String(s) => Self::write_string(buf, b'+', s),
+            Value::Error(e) => Self::write_string(buf, b'-', e),
         }
     }
 }
@@ -313,7 +319,7 @@ impl Default for BulkDecoder {
 #[derive(Debug)]
 struct ArrayDecoder {
     size_decoder: Option<IntegerDecoder>,
-    value_decoder: Option<Box<ValueDecoder>>,
+    value_decoder: Box<ValueDecoder>,
     array: Option<Vec<Value>>,
     size: usize,
 }
@@ -338,22 +344,10 @@ impl ArrayDecoder {
             return Ok(Some(Value::Array(Vec::new())));
         }
         while !input.is_empty() {
-            if self.value_decoder.is_none() {
-                self.value_decoder = Some(Box::new(ValueDecoder::new(input)?))
-            }
-            let decoded = {
-                let decoder = self.value_decoder.as_mut().unwrap();
-                if let Some(value) = decoder.try_decode(input)? {
-                    self.array.as_mut().unwrap().push(value);
-                    true
-                } else {
-                    false
-                }
-            };
-            if decoded {
-                self.value_decoder = None;
+            if let Some(value) = self.value_decoder.try_decode(input)? {
+                self.array.as_mut().unwrap().push(value);
                 if self.array.as_ref().unwrap().len() == self.size {
-                    return Ok(mem::replace(&mut self.array, None).map(Value::Array));
+                    return Ok(self.array.take().map(Value::Array));
                 }
             } else {
                 break;
@@ -375,7 +369,7 @@ impl Default for ArrayDecoder {
         ArrayDecoder {
             size_decoder: Some(IntegerDecoder::default()),
             array: None,
-            value_decoder: None,
+            value_decoder: Default::default(),
             size: 0,
         }
     }
@@ -389,10 +383,10 @@ struct IntegerDecoder {
 
 impl IntegerDecoder {
     fn decode(&mut self, input: &mut BytesMut) -> Result<i64> {
-        Ok(str::from_utf8(&split_input(input, self.inspect))
+        str::from_utf8(&split_input(input, self.inspect))
             .map_err(to_error)?
             .parse()
-            .map_err(to_error)?)
+            .map_err(to_error)
     }
 
     fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<i64>> {
@@ -409,7 +403,10 @@ impl IntegerDecoder {
                 (false, b'\r') => self.expect_lf = true,
                 (true, b'\n') => return self.decode(input).map(Some),
                 (_, b) => {
-                    return invalid_data(format!("Invalid byte '{}' when decoding integer", b))
+                    return invalid_data(format!(
+                        "Invalid byte '{}' when decoding integer {:?}",
+                        b, input
+                    ))
                 }
             }
         }
@@ -441,32 +438,33 @@ impl TypedDecoder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ValueDecoder {
-    decoder: TypedDecoder,
+    decoder: Option<TypedDecoder>,
 }
 
 impl ValueDecoder {
-    pub fn new(input: &mut BytesMut) -> Result<Self> {
-        let value_type = input[0];
-        let decoder = match value_type {
-            RESP_TYPE_BULK_STRING => TypedDecoder::Bulk(BulkDecoder::default()),
-            RESP_TYPE_ARRAY => TypedDecoder::Array(ArrayDecoder::default()),
-            RESP_TYPE_INTEGER => TypedDecoder::Integer(IntegerDecoder::default()),
-            RESP_TYPE_SIMPLE_STRING => TypedDecoder::String(StringDecoder::default()),
-            RESP_TYPE_ERROR => TypedDecoder::Error(StringDecoder::default()),
-            t => return invalid_data(format!("Invalid value type '{}'", t)),
-        };
-        input.split_to(1);
-        Ok(ValueDecoder { decoder })
-    }
-
     pub fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>> {
         if input.is_empty() {
-            Ok(None)
-        } else {
-            self.decoder.try_decode(input)
+            return Ok(None);
         }
+        if self.decoder.is_none() {
+            let decoder = match input[0] {
+                RESP_TYPE_BULK_STRING => TypedDecoder::Bulk(BulkDecoder::default()),
+                RESP_TYPE_ARRAY => TypedDecoder::Array(ArrayDecoder::default()),
+                RESP_TYPE_INTEGER => TypedDecoder::Integer(IntegerDecoder::default()),
+                RESP_TYPE_SIMPLE_STRING => TypedDecoder::String(StringDecoder::default()),
+                RESP_TYPE_ERROR => TypedDecoder::Error(StringDecoder::default()),
+                t => return invalid_data(format!("Invalid value type '{}'", t)),
+            };
+            input.advance(1);
+            self.decoder = Some(decoder);
+        }
+        let result = self.decoder.as_mut().unwrap().try_decode(input)?;
+        if result.is_some() {
+            self.decoder = None;
+        }
+        Ok(result)
     }
 }
 
@@ -478,11 +476,7 @@ mod tests {
         let len = input.len();
         for i in 1..len {
             let mut s = input[0..i].into();
-            let decoder = ValueDecoder::new(&mut s);
-            assert!(decoder.is_ok());
-            let mut decoder = decoder.unwrap();
-            assert_eq!(s.len(), i - 1);
-            let v = decoder.try_decode(&mut s);
+            let v = ValueDecoder::default().try_decode(&mut s);
             assert!(v.is_ok());
             let v = v.unwrap();
             assert!(v.is_none());
@@ -491,7 +485,7 @@ mod tests {
 
     fn test_decode(mut input: BytesMut, expect: Value) {
         test_decode_partially(&input);
-        let mut decoder = ValueDecoder::new(&mut input).unwrap();
+        let mut decoder = ValueDecoder::default();
         if let Ok(Some(v)) = decoder.try_decode(&mut input) {
             assert_eq!(v, expect);
         } else {

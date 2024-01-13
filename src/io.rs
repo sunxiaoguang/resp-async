@@ -1,70 +1,19 @@
 use std::collections::HashMap;
-use std::mem;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use futures::{future, Future, Sink, Stream};
-use tokio;
+use log::{error, info};
+use std::future::Future;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_codec::{Decoder, Encoder};
+use tokio::sync::{broadcast, mpsc};
 
 use crate::error::*;
 use crate::resp::*;
 
-#[derive(Default)]
-struct ValueCodec {
-    decoder: Option<ValueDecoder>,
-}
-
-impl Decoder for ValueCodec {
-    type Item = Value;
-    type Error = Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Value>> {
-        if src.is_empty() {
-            return Ok(None);
-        }
-        if self.decoder.is_none() {
-            self.decoder = Some(ValueDecoder::new(src)?);
-        }
-        let mut decoder = mem::replace(&mut self.decoder, None);
-        let value = decoder.as_mut().unwrap().try_decode(src)?;
-        if value.is_none() {
-            mem::replace(&mut self.decoder, decoder);
-        }
-        Ok(value)
-    }
-}
-
-impl Encoder for ValueCodec {
-    type Item = Value;
-    type Error = Error;
-
-    fn encode(&mut self, value: Value, buffer: &mut BytesMut) -> Result<()> {
-        ValueEncoder::encode(buffer, &value);
-        Ok(())
-    }
-}
-
-macro_rules! either {
-    ($expr:expr) => {
-        match $expr {
-            Ok(val) => val,
-            Err(err) => return ::futures::future::Either::A(::futures::future::err(err)),
-        }
-    };
-    ($expr:expr,) => {
-        $expr?
-    };
-}
-
-macro_rules! or {
-    ($expr:expr) => {
-        ::futures::future::Either::B($expr)
-    };
-}
+const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 
 #[derive(Debug)]
 pub struct PeerContext<T>
@@ -116,11 +65,39 @@ pub trait EventHandler {
         &self,
         peer: &mut PeerContext<Self::ClientUserData>,
         request: Value,
-    ) -> Box<dyn Future<Item = Value, Error = Error> + Send + Sync>;
-    fn on_connect(&self, _id: u64) -> Result<Self::ClientUserData> {
-        Ok(Self::ClientUserData::default())
+    ) -> impl Future<Output = Result<Value>> + Send;
+    fn on_connect(&self, _id: u64) -> impl Future<Output = Result<Self::ClientUserData>> + Send {
+        async { Ok(Self::ClientUserData::default()) }
     }
-    fn on_disconnect(&self, _id: u64) {}
+    fn on_disconnect(&self, _id: u64) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+}
+
+struct Shutdown {
+    is_shutdown: bool,
+    notify: broadcast::Receiver<()>,
+}
+
+impl Shutdown {
+    pub(crate) fn new(notify: broadcast::Receiver<()>) -> Shutdown {
+        Shutdown {
+            is_shutdown: false,
+            notify,
+        }
+    }
+
+    pub(crate) async fn recv(&mut self) {
+        if self.is_shutdown {
+            return;
+        }
+        let _ = self.notify.recv().await;
+        self.is_shutdown = true;
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.is_shutdown
+    }
 }
 
 pub struct Server<H>
@@ -128,7 +105,7 @@ where
     H: EventHandler + Send + Sync + 'static,
 {
     handler: Arc<H>,
-    addresses: Vec<TcpListener>,
+    address: String,
     client_id: Arc<AtomicU64>,
 }
 
@@ -139,63 +116,115 @@ where
     pub fn new(handler: H) -> Self {
         Server {
             handler: Arc::new(handler),
-            addresses: Vec::with_capacity(1),
+            address: DEFAULT_ADDRESS.into(),
             client_id: Arc::new(AtomicU64::default()),
         }
     }
 
-    pub fn listen(&mut self, addr: &SocketAddr) -> Result<&mut Self> {
-        self.addresses.push(TcpListener::bind(addr)?);
+    pub fn listen(&mut self, addr: impl Into<String>) -> Result<&mut Self> {
+        self.address = addr.into();
         Ok(self)
     }
 
-    fn try_process(
-        id: u64,
+    async fn run_client_loop(
+        user_data: H::ClientUserData,
         handler: Arc<H>,
-        socket: TcpStream,
-    ) -> impl Future<Item = (), Error = Error> {
-        let user_data = either!(handler.on_connect(id));
+        mut socket: TcpStream,
+    ) -> Result<()> {
         let mut client = PeerContext {
-            peer: either!(socket.peer_addr()),
-            local: either!(socket.local_addr()),
+            peer: socket.peer_addr()?,
+            local: socket.local_addr()?,
             ctx: HashMap::new(),
             user_data,
         };
-        let (tx, rx) = ValueCodec::default().framed(socket).split();
-        let disconnect_handler = Arc::clone(&handler);
-        or!(tx
-            .send_all(rx.and_then(move |v| handler.on_request(&mut client, v)))
-            .then(move |r| {
-                disconnect_handler.on_disconnect(id);
-                r.map(|_| ())
-            }))
+        let mut rd = BytesMut::new();
+        let mut wr = BytesMut::new();
+        let mut decoder = ValueDecoder::default();
+        loop {
+            if let Some(value) = decoder.try_decode(&mut rd)? {
+                handler
+                    .on_request(&mut client, value)
+                    .await?
+                    .encode(&mut wr);
+                socket.write_all(&wr).await?;
+                wr.clear();
+                socket.flush().await?;
+            }
+
+            if 0 == socket.read_buf(&mut rd).await? && rd.is_empty() {
+                return Ok(());
+            }
+        }
     }
 
-    fn process(id: u64, handler: Arc<H>, socket: TcpStream) -> impl Future<Item = (), Error = ()> {
-        Self::try_process(id, handler, socket)
-            .map_err(move |e| warn!("Failed to handle connection: {}", e))
+    async fn run_client_hooks(id: u64, handler: Arc<H>, socket: TcpStream) -> Result<()> {
+        let user_data = handler.on_connect(id).await?;
+        let result = Self::run_client_loop(user_data, Arc::clone(&handler), socket).await;
+        handler.on_disconnect(id).await;
+        result
     }
 
-    pub fn serve(&mut self) -> Result<()> {
-        let addresses: Vec<TcpListener> = self.addresses.drain(..).collect();
-        let handler = Arc::clone(&self.handler);
-        let client_id = Arc::clone(&self.client_id);
-        tokio::run(
-            future::join_all(addresses.into_iter().map(move |l| {
-                let handler = Arc::clone(&handler);
-                let client_id = Arc::clone(&client_id);
-                l.incoming()
-                    .map_err(|e| warn!("Failed to accept connection: {}", e))
-                    .for_each(move |socket| {
-                        tokio::spawn(Self::process(
-                            client_id.fetch_add(1, Ordering::AcqRel),
-                            Arc::clone(&handler),
-                            socket,
-                        ))
-                    })
-            }))
-            .map(|_| ()),
-        );
+    async fn run_client(
+        id: u64,
+        handler: Arc<H>,
+        socket: TcpStream,
+        notify_shutdown: broadcast::Sender<()>,
+        _shutdown_complete_tx: mpsc::Sender<()>,
+    ) -> Result<()> {
+        let mut shutdown = Shutdown::new(notify_shutdown.subscribe());
+        tokio::select! {
+            res = Self::run_client_hooks(id, handler, socket) => { res }
+            _ = shutdown.recv() => { Ok(()) }
+        }
+    }
+
+    async fn run_accept_loop(
+        &mut self,
+        listener: TcpListener,
+        notify_shutdown: broadcast::Sender<()>,
+        shutdown_complete_tx: mpsc::Sender<()>,
+    ) -> Result<()> {
+        let mut shutdown = Shutdown::new(notify_shutdown.subscribe());
+        while !shutdown.is_shutdown() {
+            tokio::select! {
+                res = listener.accept() => {
+                    if let Ok((socket, _)) = res {
+                        let handler = Arc::clone(&self.handler);
+                        let client_id = Arc::clone(&self.client_id);
+                        let notify_shutdown = Clone::clone(&notify_shutdown);
+                        let shutdown_complete_tx = Clone::clone(&shutdown_complete_tx);
+                        tokio::spawn(async move {
+                            Self::run_client(client_id.fetch_add(1, Ordering::AcqRel), handler, socket, notify_shutdown, shutdown_complete_tx).await
+                        });
+                    }
+                },
+                _ = shutdown.recv() => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn serve(&mut self, shutdown: impl Future) -> Result<()> {
+        let listener = TcpListener::bind(&self.address).await?;
+
+        let (notify_shutdown, _) = broadcast::channel(1);
+        let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
+
+        tokio::select! {
+            res = self.run_accept_loop(listener, Clone::clone(&notify_shutdown), Clone::clone(&shutdown_complete_tx)) => {
+                if let Err(err) = res {
+                    error!("Failed to accept {:?}", err);
+                }
+            }
+            _ = shutdown => {
+                info!("shutting down server");
+            }
+        };
+
+        drop(notify_shutdown);
+        drop(shutdown_complete_tx);
+
+        let _ = shutdown_complete_rx.recv().await;
         Ok(())
     }
 }

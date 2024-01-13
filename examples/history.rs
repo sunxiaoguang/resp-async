@@ -1,18 +1,14 @@
-extern crate futures;
 extern crate resp_async;
 extern crate tokio;
-extern crate tokio_codec;
 #[macro_use]
 extern crate log;
 extern crate simplelog;
 
 use std::env;
-use std::net::SocketAddr;
 use std::sync::Mutex;
 
-use futures::future;
 use simplelog::*;
-use tokio::prelude::*;
+use tokio::signal;
 
 use resp_async::error::*;
 use resp_async::*;
@@ -25,11 +21,24 @@ struct HistoryServer {
 impl EventHandler for HistoryServer {
     type ClientUserData = i32;
 
-    fn on_request(
+    async fn on_request(
         &self,
         peer: &mut PeerContext<Self::ClientUserData>,
         request: Value,
-    ) -> Box<dyn Future<Item = Value, Error = Error> + Send + Sync> {
+    ) -> Result<Value> {
+        let mut resp = None;
+        if let Value::Array(array) = &request {
+            if array.len() == 2 {
+                if let (Some(Value::Bulk(cmd)), Some(Value::Bulk(arg))) =
+                    (array.get(0), array.get(1))
+                {
+                    if cmd == "COMMAND".as_bytes() && arg == "DOCS".as_bytes() {
+                        resp = Some(Value::Array(Vec::new()));
+                    }
+                }
+            }
+        }
+
         let value = vec![peer.user_data.into(), request].into();
         if let Some(Value::Array(history)) = peer.get_mut("history") {
             history.push(value);
@@ -37,10 +46,10 @@ impl EventHandler for HistoryServer {
             peer.set("history", vec![value].into());
         }
         peer.user_data += 1;
-        Box::new(future::ok(Clone::clone(peer.get("history").unwrap())))
+        Ok(resp.unwrap_or_else(|| Clone::clone(peer.get("history").unwrap())))
     }
 
-    fn on_connect(&self, id: u64) -> Result<Self::ClientUserData> {
+    async fn on_connect(&self, id: u64) -> Result<Self::ClientUserData> {
         let mut connections = self.connections.lock().unwrap();
         *connections += 1;
         info!("New connection: {}", id);
@@ -48,7 +57,7 @@ impl EventHandler for HistoryServer {
         Ok(0)
     }
 
-    fn on_disconnect(&self, id: u64) {
+    async fn on_disconnect(&self, id: u64) {
         let mut connections = self.connections.lock().unwrap();
         *connections -= 1;
         info!("Disconnected connection: {}", id);
@@ -56,13 +65,17 @@ impl EventHandler for HistoryServer {
     }
 }
 
-fn main() {
-    let _ = TermLogger::init(LevelFilter::Info, Config::default());
+#[tokio::main]
+pub async fn main() -> Result<()> {
+    let _ = TermLogger::init(
+        LevelFilter::Info,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    );
     let addr = env::args()
         .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let addr = addr.parse::<SocketAddr>().unwrap();
+        .unwrap_or_else(|| "0.0.0.0:6379".to_string());
     let mut server = Server::new(HistoryServer::default());
-    server.listen(&addr).unwrap();
-    server.serve().unwrap();
+    server.listen(&addr)?.serve(signal::ctrl_c()).await
 }
