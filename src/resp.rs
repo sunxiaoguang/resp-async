@@ -13,11 +13,62 @@ pub enum Value {
     Bulk(Vec<u8>),
     Null,
     Array(Vec<Value>),
+    StaticError(&'static str),
+    StaticString(&'static str),
 }
 
 impl Value {
     pub(crate) fn encode(&self, buf: &mut BytesMut) {
         ValueEncoder::encode(buf, self);
+    }
+
+    pub fn as_integer(&self) -> Result<i64> {
+        match self {
+            Value::Integer(i) => Ok(*i),
+            Value::String(s) => s.parse().map_err(to_error),
+            Value::Bulk(v) => str::from_utf8(v).map_err(to_error).and_then(|s| s.parse().map_err(to_error)),
+            _ => inconvertible(self, "Integer"),
+        }
+    }
+
+    pub fn to_integer(self) -> Result<i64> {
+        self.as_integer()
+    }
+
+    pub fn as_str(&self) -> Result<&str> {
+        match self {
+            Value::Bulk(v) => str::from_utf8(v.as_slice()).map_err(to_error),
+            Value::String(s) => Ok(s.as_str()),
+            _ => inconvertible(self, "&str"),
+        }
+    }
+
+    pub fn to_string(self) -> Result<String> {
+        match self {
+            Value::Bulk(b) => Ok(String::from_utf8(b).map_err(to_error)?),
+            Value::Integer(i) => Ok(i.to_string()),
+            Value::String(s) => Ok(s),
+            Value::Null => Ok(String::new()),
+            _ => inconvertible(&self, "String"),
+        }
+    }
+
+    pub fn as_slice(&self) -> Result<&[u8]> {
+        match self {
+            Value::Bulk(v) => Ok(v.as_slice()),
+            Value::String(s) => Ok(s.as_bytes()),
+            _ => inconvertible(self, "&[u8]"),
+        }
+    }
+
+    pub fn to_bytes(self) -> Result<Vec<u8>> {
+        match self {
+            Value::Bulk(b) => Ok(b),
+            Value::String(s) => Ok(s.into_bytes()),
+            Value::Integer(i) => Ok(i.to_string().into_bytes()),
+            Value::Null => Ok(Vec::new()),
+            _ => inconvertible(&self, "Vec<u8>")
+        }
     }
 }
 
@@ -25,16 +76,25 @@ fn inconvertible<A>(from: &Value, target: &str) -> Result<A> {
     invalid_data(format!("'{:?}' is not convertible to '{}'", from, target))
 }
 
+impl TryFrom<&Value> for String {
+    type Error = Error;
+    fn try_from(val: &Value) -> Result<String> {
+        val.as_str().map(ToOwned::to_owned)
+    }
+}
+
 impl TryFrom<Value> for String {
     type Error = Error;
-
     fn try_from(val: Value) -> Result<String> {
-        match val {
-            Value::Bulk(b) => Ok(String::from_utf8(b).map_err(to_error)?),
-            Value::Integer(i) => Ok(i.to_string()),
-            Value::String(s) => Ok(s),
-            _ => inconvertible(&val, "String"),
-        }
+        val.to_string()
+    }
+}
+
+impl TryFrom<&Value> for Vec<u8> {
+    type Error = Error;
+
+    fn try_from(val: &Value) -> Result<Vec<u8>> {
+        val.as_slice().map(ToOwned::to_owned)
     }
 }
 
@@ -42,10 +102,50 @@ impl TryFrom<Value> for Vec<u8> {
     type Error = Error;
 
     fn try_from(val: Value) -> Result<Vec<u8>> {
-        if let Value::Bulk(b) = val {
-            Ok(b)
+        val.to_bytes()
+    }
+}
+
+impl TryFrom<&Value> for Vec<String> {
+    type Error = Error;
+
+    fn try_from(val: &Value) -> Result<Vec<String>> {
+        if let Value::Array(array) = val {
+            array.iter().map(TryInto::try_into).collect()
         } else {
-            inconvertible(&val, "Vec<u8>")
+            inconvertible(val, "Vec<String>")
+        }
+    }
+}
+
+impl TryFrom<Value> for Vec<String> {
+    type Error = Error;
+
+    fn try_from(val: Value) -> Result<Vec<String>> {
+        if let Value::Array(array) = val {
+            array.into_iter().map(Value::to_string).collect()
+        } else {
+            inconvertible(&val, "Vec<String>")
+        }
+    }
+}
+
+impl From<Value> for Vec<Value> {
+    fn from(val: Value) -> Vec<Value> {
+        if let Value::Array(array) = val {
+            array
+        } else {
+            Vec::from(val)
+        }
+    }
+}
+
+impl From<&Value> for Vec<Value> {
+    fn from(val: &Value) -> Vec<Value> {
+        if let Value::Array(array) = val {
+            array.iter().map(Clone::clone).collect()
+        } else {
+            Vec::from(val)
         }
     }
 }
@@ -54,11 +154,15 @@ impl TryFrom<Value> for i64 {
     type Error = Error;
 
     fn try_from(val: Value) -> Result<i64> {
-        if let Value::Integer(i) = val {
-            Ok(i)
-        } else {
-            inconvertible(&val, "i64")
-        }
+        val.as_integer()
+    }
+}
+
+impl TryFrom<&Value> for i64 {
+    type Error = Error;
+
+    fn try_from(val: &Value) -> Result<i64> {
+        val.as_integer()
     }
 }
 
@@ -66,10 +170,22 @@ impl TryFrom<Value> for Option<Vec<u8>> {
     type Error = Error;
 
     fn try_from(val: Value) -> Result<Option<Vec<u8>>> {
-        match val {
-            Value::Bulk(b) => Ok(Some(b)),
-            Value::Null => Ok(None),
-            _ => inconvertible(&val, "Option<Vec<u8>>"),
+        if let Value::Null = val {
+            Ok(None)
+        } else {
+            val.to_bytes().map(Some)
+        }
+    }
+}
+
+impl TryFrom<&Value> for Option<Vec<u8>> {
+    type Error = Error;
+
+    fn try_from(val: &Value) -> Result<Option<Vec<u8>>> {
+        if let Value::Null = val {
+            Ok(None)
+        } else {
+            val.as_slice().map(ToOwned::to_owned).map(Some)
         }
     }
 }
@@ -207,6 +323,8 @@ impl ValueEncoder {
             Value::Bulk(b) => Self::write_bulk(buf, b'$', b),
             Value::String(s) => Self::write_string(buf, b'+', s),
             Value::Error(e) => Self::write_string(buf, b'-', e),
+            Value::StaticError(e) => Self::write_string(buf, b'-', e),
+            Value::StaticString(e) => Self::write_string(buf, b'+', e),
         }
     }
 }
