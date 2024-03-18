@@ -26,13 +26,30 @@ impl Value {
         match self {
             Value::Integer(i) => Ok(*i),
             Value::String(s) => s.parse().map_err(to_error),
-            Value::Bulk(v) => str::from_utf8(v).map_err(to_error).and_then(|s| s.parse().map_err(to_error)),
+            Value::Bulk(v) => str::from_utf8(v)
+                .map_err(to_error)
+                .and_then(|s| s.parse().map_err(to_error)),
             _ => inconvertible(self, "Integer"),
         }
     }
 
     pub fn to_integer(self) -> Result<i64> {
         self.as_integer()
+    }
+
+    pub fn as_float(&self) -> Result<f64> {
+        match self {
+            Value::Integer(i) => Ok((*i) as f64),
+            Value::String(s) => s.parse().map_err(to_error),
+            Value::Bulk(v) => str::from_utf8(v)
+                .map_err(to_error)
+                .and_then(|s| s.parse().map_err(to_error)),
+            _ => inconvertible(self, "Float"),
+        }
+    }
+
+    pub fn to_float(self) -> Result<f64> {
+        self.as_float()
     }
 
     pub fn as_str(&self) -> Result<&str> {
@@ -67,7 +84,7 @@ impl Value {
             Value::String(s) => Ok(s.into_bytes()),
             Value::Integer(i) => Ok(i.to_string().into_bytes()),
             Value::Null => Ok(Vec::new()),
-            _ => inconvertible(&self, "Vec<u8>")
+            _ => inconvertible(&self, "Vec<u8>"),
         }
     }
 }
@@ -78,14 +95,14 @@ fn inconvertible<A>(from: &Value, target: &str) -> Result<A> {
 
 impl TryFrom<&Value> for String {
     type Error = Error;
-    fn try_from(val: &Value) -> Result<String> {
+    fn try_from(val: &Value) -> Result<Self> {
         val.as_str().map(ToOwned::to_owned)
     }
 }
 
 impl TryFrom<Value> for String {
     type Error = Error;
-    fn try_from(val: Value) -> Result<String> {
+    fn try_from(val: Value) -> Result<Self> {
         val.to_string()
     }
 }
@@ -93,7 +110,7 @@ impl TryFrom<Value> for String {
 impl TryFrom<&Value> for Vec<u8> {
     type Error = Error;
 
-    fn try_from(val: &Value) -> Result<Vec<u8>> {
+    fn try_from(val: &Value) -> Result<Self> {
         val.as_slice().map(ToOwned::to_owned)
     }
 }
@@ -101,7 +118,7 @@ impl TryFrom<&Value> for Vec<u8> {
 impl TryFrom<Value> for Vec<u8> {
     type Error = Error;
 
-    fn try_from(val: Value) -> Result<Vec<u8>> {
+    fn try_from(val: Value) -> Result<Self> {
         val.to_bytes()
     }
 }
@@ -109,7 +126,7 @@ impl TryFrom<Value> for Vec<u8> {
 impl TryFrom<&Value> for Vec<String> {
     type Error = Error;
 
-    fn try_from(val: &Value) -> Result<Vec<String>> {
+    fn try_from(val: &Value) -> Result<Self> {
         if let Value::Array(array) = val {
             array.iter().map(TryInto::try_into).collect()
         } else {
@@ -121,7 +138,7 @@ impl TryFrom<&Value> for Vec<String> {
 impl TryFrom<Value> for Vec<String> {
     type Error = Error;
 
-    fn try_from(val: Value) -> Result<Vec<String>> {
+    fn try_from(val: Value) -> Result<Self> {
         if let Value::Array(array) = val {
             array.into_iter().map(Value::to_string).collect()
         } else {
@@ -131,7 +148,7 @@ impl TryFrom<Value> for Vec<String> {
 }
 
 impl From<Value> for Vec<Value> {
-    fn from(val: Value) -> Vec<Value> {
+    fn from(val: Value) -> Self {
         if let Value::Array(array) = val {
             array
         } else {
@@ -141,7 +158,7 @@ impl From<Value> for Vec<Value> {
 }
 
 impl From<&Value> for Vec<Value> {
-    fn from(val: &Value) -> Vec<Value> {
+    fn from(val: &Value) -> Self {
         if let Value::Array(array) = val {
             array.iter().map(Clone::clone).collect()
         } else {
@@ -153,7 +170,7 @@ impl From<&Value> for Vec<Value> {
 impl TryFrom<Value> for i64 {
     type Error = Error;
 
-    fn try_from(val: Value) -> Result<i64> {
+    fn try_from(val: Value) -> Result<Self> {
         val.as_integer()
     }
 }
@@ -161,15 +178,31 @@ impl TryFrom<Value> for i64 {
 impl TryFrom<&Value> for i64 {
     type Error = Error;
 
-    fn try_from(val: &Value) -> Result<i64> {
+    fn try_from(val: &Value) -> Result<Self> {
         val.as_integer()
+    }
+}
+
+impl TryFrom<Value> for f64 {
+    type Error = Error;
+
+    fn try_from(val: Value) -> Result<Self> {
+        val.as_float()
+    }
+}
+
+impl TryFrom<&Value> for f64 {
+    type Error = Error;
+
+    fn try_from(val: &Value) -> Result<Self> {
+        val.as_float()
     }
 }
 
 impl TryFrom<Value> for Option<Vec<u8>> {
     type Error = Error;
 
-    fn try_from(val: Value) -> Result<Option<Vec<u8>>> {
+    fn try_from(val: Value) -> Result<Self> {
         if let Value::Null = val {
             Ok(None)
         } else {
@@ -181,7 +214,7 @@ impl TryFrom<Value> for Option<Vec<u8>> {
 impl TryFrom<&Value> for Option<Vec<u8>> {
     type Error = Error;
 
-    fn try_from(val: &Value) -> Result<Option<Vec<u8>>> {
+    fn try_from(val: &Value) -> Result<Self> {
         if let Value::Null = val {
             Ok(None)
         } else {
@@ -368,7 +401,7 @@ impl StringDecoder {
                 (false, _) => (),
                 (true, b'\n') => return self.decode(input).map(Some),
                 (true, b) => {
-                    return invalid_data(format!("Invalid last tailing line feed: '{}'", b))
+                    return invalid_data(format!("Invalid last tailing line feed: '{}'", b));
                 }
             }
         }
@@ -524,7 +557,7 @@ impl IntegerDecoder {
                     return invalid_data(format!(
                         "Invalid byte '{}' when decoding integer {:?}",
                         b, input
-                    ))
+                    ));
                 }
             }
         }
