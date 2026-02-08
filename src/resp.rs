@@ -1,87 +1,96 @@
 use std::convert::{From, TryFrom};
 use std::str;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::error::{invalid_data, to_error, Error, Result};
+use crate::response::RespError;
 
+/// Limits for decoding RESP frames.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DecodeLimits {
+    pub max_bulk_len: usize,
+    pub max_array_len: usize,
+    pub max_depth: usize,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_bulk_len: 1 << 20,
+            max_array_len: 1024,
+            max_depth: 16,
+        }
+    }
+}
+
+/// RESP frame value.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Value {
-    String(String),
-    Error(String),
+    Simple(Bytes),
+    Error(Bytes),
     Integer(i64),
-    Bulk(Vec<u8>),
+    Bulk(Bytes),
     Null,
     Array(Vec<Value>),
-    StaticError(&'static str),
-    StaticString(&'static str),
 }
 
 impl Value {
-    pub(crate) fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) {
         ValueEncoder::encode(buf, self);
     }
 
-    pub fn as_integer(&self) -> Result<i64> {
+    pub fn as_integer(&self) -> Result<i64, RespError> {
         match self {
             Value::Integer(i) => Ok(*i),
-            Value::String(s) => s.parse().map_err(to_error),
-            Value::Bulk(v) => str::from_utf8(v)
-                .map_err(to_error)
-                .and_then(|s| s.parse().map_err(to_error)),
+            Value::Simple(s) | Value::Bulk(s) => parse_int(s),
             _ => inconvertible(self, "Integer"),
         }
     }
 
-    pub fn to_integer(self) -> Result<i64> {
+    pub fn to_integer(self) -> Result<i64, RespError> {
         self.as_integer()
     }
 
-    pub fn as_float(&self) -> Result<f64> {
+    pub fn as_float(&self) -> Result<f64, RespError> {
         match self {
-            Value::Integer(i) => Ok((*i) as f64),
-            Value::String(s) => s.parse().map_err(to_error),
-            Value::Bulk(v) => str::from_utf8(v)
-                .map_err(to_error)
-                .and_then(|s| s.parse().map_err(to_error)),
+            Value::Integer(i) => Ok(*i as f64),
+            Value::Simple(s) | Value::Bulk(s) => parse_float(s),
             _ => inconvertible(self, "Float"),
         }
     }
 
-    pub fn to_float(self) -> Result<f64> {
+    pub fn to_float(self) -> Result<f64, RespError> {
         self.as_float()
     }
 
-    pub fn as_str(&self) -> Result<&str> {
+    pub fn as_str(&self) -> Result<&str, RespError> {
         match self {
-            Value::Bulk(v) => str::from_utf8(v.as_slice()).map_err(to_error),
-            Value::String(s) => Ok(s.as_str()),
+            Value::Bulk(v) | Value::Simple(v) => str::from_utf8(v)
+                .map_err(|err| RespError::invalid_data(format!("invalid utf-8: {}", err))),
             _ => inconvertible(self, "&str"),
         }
     }
 
-    pub fn to_string(self) -> Result<String> {
+    pub fn to_string(self) -> Result<String, RespError> {
         match self {
-            Value::Bulk(b) => Ok(String::from_utf8(b).map_err(to_error)?),
+            Value::Bulk(b) | Value::Simple(b) => Ok(String::from_utf8(b.to_vec())
+                .map_err(|err| RespError::invalid_data(format!("invalid utf-8: {}", err)))?),
             Value::Integer(i) => Ok(i.to_string()),
-            Value::String(s) => Ok(s),
             Value::Null => Ok(String::new()),
             _ => inconvertible(&self, "String"),
         }
     }
 
-    pub fn as_slice(&self) -> Result<&[u8]> {
+    pub fn as_slice(&self) -> Result<&[u8], RespError> {
         match self {
-            Value::Bulk(v) => Ok(v.as_slice()),
-            Value::String(s) => Ok(s.as_bytes()),
+            Value::Bulk(v) | Value::Simple(v) => Ok(v.as_ref()),
             _ => inconvertible(self, "&[u8]"),
         }
     }
 
-    pub fn to_bytes(self) -> Result<Vec<u8>> {
+    pub fn to_bytes(self) -> Result<Vec<u8>, RespError> {
         match self {
-            Value::Bulk(b) => Ok(b),
-            Value::String(s) => Ok(s.into_bytes()),
+            Value::Bulk(b) | Value::Simple(b) => Ok(b.to_vec()),
             Value::Integer(i) => Ok(i.to_string().into_bytes()),
             Value::Null => Ok(Vec::new()),
             _ => inconvertible(&self, "Vec<u8>"),
@@ -89,44 +98,61 @@ impl Value {
     }
 }
 
-fn inconvertible<A>(from: &Value, target: &str) -> Result<A> {
-    invalid_data(format!("'{:?}' is not convertible to '{}'", from, target))
+fn parse_int(bytes: &Bytes) -> Result<i64, RespError> {
+    str::from_utf8(bytes)
+        .map_err(|err| RespError::invalid_data(format!("invalid utf-8: {}", err)))?
+        .parse()
+        .map_err(|err| RespError::invalid_data(format!("invalid integer: {}", err)))
+}
+
+fn parse_float(bytes: &Bytes) -> Result<f64, RespError> {
+    str::from_utf8(bytes)
+        .map_err(|err| RespError::invalid_data(format!("invalid utf-8: {}", err)))?
+        .parse()
+        .map_err(|err| RespError::invalid_data(format!("invalid float: {}", err)))
+}
+
+fn inconvertible<A>(from: &Value, target: &str) -> Result<A, RespError> {
+    Err(RespError::invalid_data(format!(
+        "'{:?}' is not convertible to '{}'",
+        from, target
+    )))
 }
 
 impl TryFrom<&Value> for String {
-    type Error = Error;
-    fn try_from(val: &Value) -> Result<Self> {
+    type Error = RespError;
+    fn try_from(val: &Value) -> Result<Self, Self::Error> {
         val.as_str().map(ToOwned::to_owned)
     }
 }
 
 impl TryFrom<Value> for String {
-    type Error = Error;
-    fn try_from(val: Value) -> Result<Self> {
+    type Error = RespError;
+    fn try_from(val: Value) -> Result<Self, Self::Error> {
         val.to_string()
     }
 }
 
 impl TryFrom<&Value> for Vec<u8> {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: &Value) -> Result<Self> {
+    fn try_from(val: &Value) -> Result<Self, Self::Error> {
         val.as_slice().map(ToOwned::to_owned)
     }
 }
 
 impl TryFrom<Value> for Vec<u8> {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: Value) -> Result<Self> {
+    fn try_from(val: Value) -> Result<Self, Self::Error> {
         val.to_bytes()
     }
 }
 
 impl TryFrom<&Value> for Vec<String> {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: &Value) -> Result<Self> {
+    fn try_from(val: &Value) -> Result<Self, Self::Error> {
         if let Value::Array(array) = val {
             array.iter().map(TryInto::try_into).collect()
         } else {
@@ -136,9 +162,9 @@ impl TryFrom<&Value> for Vec<String> {
 }
 
 impl TryFrom<Value> for Vec<String> {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: Value) -> Result<Self> {
+    fn try_from(val: Value) -> Result<Self, Self::Error> {
         if let Value::Array(array) = val {
             array.into_iter().map(Value::to_string).collect()
         } else {
@@ -160,7 +186,7 @@ impl From<Value> for Vec<Value> {
 impl From<&Value> for Vec<Value> {
     fn from(val: &Value) -> Self {
         if let Value::Array(array) = val {
-            array.iter().map(Clone::clone).collect()
+            array.iter().cloned().collect()
         } else {
             Vec::from(val)
         }
@@ -168,41 +194,41 @@ impl From<&Value> for Vec<Value> {
 }
 
 impl TryFrom<Value> for i64 {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: Value) -> Result<Self> {
+    fn try_from(val: Value) -> Result<Self, Self::Error> {
         val.as_integer()
     }
 }
 
 impl TryFrom<&Value> for i64 {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: &Value) -> Result<Self> {
+    fn try_from(val: &Value) -> Result<Self, Self::Error> {
         val.as_integer()
     }
 }
 
 impl TryFrom<Value> for f64 {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: Value) -> Result<Self> {
+    fn try_from(val: Value) -> Result<Self, Self::Error> {
         val.as_float()
     }
 }
 
 impl TryFrom<&Value> for f64 {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: &Value) -> Result<Self> {
+    fn try_from(val: &Value) -> Result<Self, Self::Error> {
         val.as_float()
     }
 }
 
 impl TryFrom<Value> for Option<Vec<u8>> {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: Value) -> Result<Self> {
+    fn try_from(val: Value) -> Result<Self, Self::Error> {
         if let Value::Null = val {
             Ok(None)
         } else {
@@ -212,9 +238,9 @@ impl TryFrom<Value> for Option<Vec<u8>> {
 }
 
 impl TryFrom<&Value> for Option<Vec<u8>> {
-    type Error = Error;
+    type Error = RespError;
 
-    fn try_from(val: &Value) -> Result<Self> {
+    fn try_from(val: &Value) -> Result<Self, Self::Error> {
         if let Value::Null = val {
             Ok(None)
         } else {
@@ -253,16 +279,34 @@ impl From<u64> for Value {
     }
 }
 
+impl From<Bytes> for Value {
+    fn from(b: Bytes) -> Self {
+        Value::Bulk(b)
+    }
+}
+
+impl From<&'static [u8]> for Value {
+    fn from(b: &'static [u8]) -> Self {
+        Value::Bulk(Bytes::from_static(b))
+    }
+}
+
+impl From<&'static str> for Value {
+    fn from(s: &'static str) -> Self {
+        Value::Bulk(Bytes::from_static(s.as_bytes()))
+    }
+}
+
 impl From<Vec<u8>> for Value {
     fn from(b: Vec<u8>) -> Self {
-        Value::Bulk(b)
+        Value::Bulk(Bytes::from(b))
     }
 }
 
 impl From<Option<Vec<u8>>> for Value {
     fn from(b: Option<Vec<u8>>) -> Self {
         match b {
-            Some(b) => Value::Bulk(b),
+            Some(b) => Value::Bulk(Bytes::from(b)),
             None => Value::Null,
         }
     }
@@ -277,6 +321,7 @@ where
     }
 }
 
+/// Encoder for RESP values.
 pub struct ValueEncoder;
 
 impl ValueEncoder {
@@ -292,54 +337,49 @@ impl ValueEncoder {
         buf.put_slice(b"\r\n");
     }
 
-    fn write_header_format(buf: &mut [u8], ty: u8, number: i64) -> &[u8] {
-        let s = format!("{}{}\r\n", char::from(ty), number);
-        let s = s.as_bytes();
-        let buf = &mut buf[0..s.len()];
-        buf.copy_from_slice(s);
-        buf
-    }
+    fn write_header(buf: &mut BytesMut, ty: u8, number: i64) {
+        let mut hdr = [0u8; 32];
+        let mut idx = hdr.len();
+        hdr[idx - 1] = b'\n';
+        hdr[idx - 2] = b'\r';
+        idx -= 2;
 
-    fn write_header_fast(buf: &mut [u8], ty: u8, number: i64) -> &[u8] {
-        let len = buf.len();
-        buf[len - 1] = b'\n';
-        buf[len - 2] = b'\r';
-        let mut i = len - 3;
-        let mut number = number;
+        let negative = number < 0;
+        let mut n = if negative {
+            number.wrapping_neg() as u64
+        } else {
+            number as u64
+        };
         loop {
-            buf[i] = b'0' + (number % 10) as u8;
-            i -= 1;
-            number /= 10;
-            if number == 0 {
+            idx -= 1;
+            hdr[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
                 break;
             }
         }
-        buf[i] = ty;
-        &buf[i..]
-    }
-
-    fn write_header(buf: &mut BytesMut, ty: u8, number: i64) {
-        let mut hdr = [0u8; 32];
-        let hdr = if number < 0 {
-            Self::write_header_format(&mut hdr, ty, number)
-        } else {
-            Self::write_header_fast(&mut hdr, ty, number)
-        };
+        if negative {
+            idx -= 1;
+            hdr[idx] = b'-';
+        }
+        idx -= 1;
+        hdr[idx] = ty;
+        let hdr = &hdr[idx..];
         Self::ensure_capacity(buf, hdr.len());
-        buf.put(hdr)
+        buf.put_slice(hdr);
     }
 
-    fn write_bulk(buf: &mut BytesMut, ty: u8, bytes: &[u8]) {
+    fn write_bulk(buf: &mut BytesMut, ty: u8, bytes: &Bytes) {
         Self::ensure_capacity(buf, bytes.len() + 32);
         Self::write_header(buf, ty, bytes.len() as i64);
-        buf.put(bytes);
+        buf.put(bytes.as_ref());
         Self::write_crlf(buf);
     }
 
-    fn write_string(buf: &mut BytesMut, ty: u8, str: &str) {
-        Self::ensure_capacity(buf, str.len() + 3);
+    fn write_simple(buf: &mut BytesMut, ty: u8, bytes: &Bytes) {
+        Self::ensure_capacity(buf, bytes.len() + 3);
         buf.put_u8(ty);
-        buf.put(str.as_bytes());
+        buf.put(bytes.as_ref());
         Self::write_crlf(buf);
     }
 
@@ -354,10 +394,8 @@ impl ValueEncoder {
             }
             Value::Integer(i) => Self::write_header(buf, b':', *i),
             Value::Bulk(b) => Self::write_bulk(buf, b'$', b),
-            Value::String(s) => Self::write_string(buf, b'+', s),
-            Value::Error(e) => Self::write_string(buf, b'-', e),
-            Value::StaticError(e) => Self::write_string(buf, b'-', e),
-            Value::StaticString(e) => Self::write_string(buf, b'+', e),
+            Value::Simple(s) => Self::write_simple(buf, b'+', s),
+            Value::Error(e) => Self::write_simple(buf, b'-', e),
         }
     }
 }
@@ -368,11 +406,11 @@ const RESP_TYPE_INTEGER: u8 = b':';
 const RESP_TYPE_SIMPLE_STRING: u8 = b'+';
 const RESP_TYPE_ERROR: u8 = b'-';
 
-fn split_input(input: &mut BytesMut, at: usize) -> BytesMut {
+fn split_input(input: &mut BytesMut, at: usize) -> Bytes {
     let mut buf = input.split_to(at);
     let len = buf.len();
     buf.truncate(len - 2);
-    buf
+    buf.freeze()
 }
 
 #[derive(Debug, Default)]
@@ -382,13 +420,11 @@ struct StringDecoder {
 }
 
 impl StringDecoder {
-    fn decode(&mut self, input: &mut BytesMut) -> Result<String> {
-        Ok(str::from_utf8(&split_input(input, self.inspect))
-            .map_err(to_error)?
-            .into())
+    fn decode(&mut self, input: &mut BytesMut) -> Result<Bytes, RespError> {
+        Ok(split_input(input, self.inspect))
     }
 
-    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<String>> {
+    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Bytes>, RespError> {
         let length = input.len();
         loop {
             if length <= self.inspect {
@@ -401,7 +437,10 @@ impl StringDecoder {
                 (false, _) => (),
                 (true, b'\n') => return self.decode(input).map(Some),
                 (true, b) => {
-                    return invalid_data(format!("Invalid last tailing line feed: '{}'", b));
+                    return Err(RespError::invalid_data(format!(
+                        "Invalid last tailing line feed: '{}'",
+                        b
+                    )));
                 }
             }
         }
@@ -412,10 +451,19 @@ impl StringDecoder {
 struct BulkDecoder {
     length_decoder: Option<IntegerDecoder>,
     length: i64,
+    max_bulk_len: usize,
 }
 
 impl BulkDecoder {
-    fn try_decode_length(&mut self, input: &mut BytesMut) -> Result<bool> {
+    fn new(limits: DecodeLimits) -> Self {
+        BulkDecoder {
+            length_decoder: Some(IntegerDecoder::default()),
+            length: 0,
+            max_bulk_len: limits.max_bulk_len,
+        }
+    }
+
+    fn try_decode_length(&mut self, input: &mut BytesMut) -> Result<bool, RespError> {
         if let Some(length) = self.length_decoder.as_mut().unwrap().try_decode(input)? {
             self.length_decoder = None;
             self.length = length;
@@ -425,45 +473,45 @@ impl BulkDecoder {
         }
     }
 
-    fn try_decode_bulk(&mut self, input: &mut BytesMut) -> Result<Option<Value>> {
+    fn try_decode_bulk(&mut self, input: &mut BytesMut) -> Result<Option<Value>, RespError> {
         if self.length < 0 {
             return if self.length == -1 {
                 Ok(Some(Value::Null))
             } else {
-                invalid_data(format!("Invalid bulk length: '{}'", self.length))
+                Err(RespError::invalid_data(format!(
+                    "Invalid bulk length: '{}'",
+                    self.length
+                )))
             };
         }
         let length = self.length as usize;
+        if length > self.max_bulk_len {
+            return Err(RespError::invalid_data(format!(
+                "Invalid bulk length: '{}' (limit {})",
+                length, self.max_bulk_len
+            )));
+        }
         let len = input.len();
         if len < length + 2 {
             return Ok(None);
         }
         if input[length] != b'\r' || input[length + 1] != b'\n' {
-            return invalid_data(format!(
+            return Err(RespError::invalid_data(format!(
                 "Invalid bulk tailing bytes: '[{}, {}]'",
                 input[length],
                 input[length + 1]
-            ));
+            )));
         }
-        let mut bulk = input.split_to(length + 2).to_vec();
+        let mut bulk = input.split_to(length + 2);
         bulk.truncate(length);
-        Ok(Some(Value::Bulk(bulk)))
+        Ok(Some(Value::Bulk(bulk.freeze())))
     }
 
-    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>> {
+    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>, RespError> {
         if self.length_decoder.is_some() && !self.try_decode_length(input)? {
             return Ok(None);
         }
         self.try_decode_bulk(input)
-    }
-}
-
-impl Default for BulkDecoder {
-    fn default() -> Self {
-        BulkDecoder {
-            length_decoder: Some(IntegerDecoder::default()),
-            length: 0,
-        }
     }
 }
 
@@ -473,16 +521,36 @@ struct ArrayDecoder {
     value_decoder: Box<ValueDecoder>,
     array: Option<Vec<Value>>,
     size: usize,
+    max_array_len: usize,
 }
 
 impl ArrayDecoder {
-    fn try_decode_size(&mut self, input: &mut BytesMut) -> Result<bool> {
+    fn new(limits: DecodeLimits, depth: usize) -> Self {
+        ArrayDecoder {
+            size_decoder: Some(IntegerDecoder::default()),
+            array: None,
+            value_decoder: Box::new(ValueDecoder::with_depth(limits, depth)),
+            size: 0,
+            max_array_len: limits.max_array_len,
+        }
+    }
+
+    fn try_decode_size(&mut self, input: &mut BytesMut) -> Result<bool, RespError> {
         if let Some(size) = self.size_decoder.as_mut().unwrap().try_decode(input)? {
             self.size_decoder = None;
             if size < 0 {
-                return invalid_data(format!("Invalid array size '{}'", size));
+                return Err(RespError::invalid_data(format!(
+                    "Invalid array size '{}'",
+                    size
+                )));
             }
             self.size = size as usize;
+            if self.size > self.max_array_len {
+                return Err(RespError::invalid_data(format!(
+                    "Invalid array size '{}' (limit {})",
+                    self.size, self.max_array_len
+                )));
+            }
             self.array = Some(Vec::with_capacity(self.size));
             Ok(true)
         } else {
@@ -490,7 +558,7 @@ impl ArrayDecoder {
         }
     }
 
-    fn try_decode_element(&mut self, input: &mut BytesMut) -> Result<Option<Value>> {
+    fn try_decode_element(&mut self, input: &mut BytesMut) -> Result<Option<Value>, RespError> {
         if self.size == 0 {
             return Ok(Some(Value::Array(Vec::new())));
         }
@@ -507,22 +575,11 @@ impl ArrayDecoder {
         Ok(None)
     }
 
-    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>> {
+    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>, RespError> {
         if self.size_decoder.is_some() && !self.try_decode_size(input)? {
             return Ok(None);
         }
         self.try_decode_element(input)
-    }
-}
-
-impl Default for ArrayDecoder {
-    fn default() -> Self {
-        ArrayDecoder {
-            size_decoder: Some(IntegerDecoder::default()),
-            array: None,
-            value_decoder: Default::default(),
-            size: 0,
-        }
     }
 }
 
@@ -533,14 +590,15 @@ struct IntegerDecoder {
 }
 
 impl IntegerDecoder {
-    fn decode(&mut self, input: &mut BytesMut) -> Result<i64> {
-        str::from_utf8(&split_input(input, self.inspect))
-            .map_err(to_error)?
+    fn decode(&mut self, input: &mut BytesMut) -> Result<i64, RespError> {
+        let bytes = split_input(input, self.inspect);
+        str::from_utf8(&bytes)
+            .map_err(|err| RespError::invalid_data(format!("invalid utf-8: {}", err)))?
             .parse()
-            .map_err(to_error)
+            .map_err(|err| RespError::invalid_data(format!("invalid integer: {}", err)))
     }
 
-    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<i64>> {
+    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<i64>, RespError> {
         let length = input.len();
         loop {
             if length <= self.inspect {
@@ -554,10 +612,10 @@ impl IntegerDecoder {
                 (false, b'\r') => self.expect_lf = true,
                 (true, b'\n') => return self.decode(input).map(Some),
                 (_, b) => {
-                    return invalid_data(format!(
-                        "Invalid byte '{}' when decoding integer {:?}",
-                        b, input
-                    ));
+                    return Err(RespError::invalid_data(format!(
+                        "Invalid byte '{}' when decoding integer",
+                        b
+                    )));
                 }
             }
         }
@@ -574,10 +632,10 @@ enum TypedDecoder {
 }
 
 impl TypedDecoder {
-    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>> {
+    fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>, RespError> {
         match self {
             TypedDecoder::String(decoder) => {
-                decoder.try_decode(input).map(|x| x.map(Value::String))
+                decoder.try_decode(input).map(|x| x.map(Value::Simple))
             }
             TypedDecoder::Error(decoder) => decoder.try_decode(input).map(|x| x.map(Value::Error)),
             TypedDecoder::Integer(decoder) => {
@@ -589,24 +647,56 @@ impl TypedDecoder {
     }
 }
 
-#[derive(Debug, Default)]
+/// Streaming RESP decoder.
+#[derive(Debug)]
 pub struct ValueDecoder {
     decoder: Option<TypedDecoder>,
+    limits: DecodeLimits,
+    depth: usize,
 }
 
 impl ValueDecoder {
-    pub fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>> {
+    pub fn new(limits: DecodeLimits) -> Self {
+        Self {
+            decoder: None,
+            limits,
+            depth: 0,
+        }
+    }
+
+    fn with_depth(limits: DecodeLimits, depth: usize) -> Self {
+        Self {
+            decoder: None,
+            limits,
+            depth,
+        }
+    }
+
+    pub fn try_decode(&mut self, input: &mut BytesMut) -> Result<Option<Value>, RespError> {
         if input.is_empty() {
             return Ok(None);
         }
         if self.decoder.is_none() {
             let decoder = match input[0] {
-                RESP_TYPE_BULK_STRING => TypedDecoder::Bulk(BulkDecoder::default()),
-                RESP_TYPE_ARRAY => TypedDecoder::Array(ArrayDecoder::default()),
+                RESP_TYPE_BULK_STRING => TypedDecoder::Bulk(BulkDecoder::new(self.limits)),
+                RESP_TYPE_ARRAY => {
+                    if self.depth + 1 > self.limits.max_depth {
+                        return Err(RespError::invalid_data(format!(
+                            "ERR max depth exceeded (limit {})",
+                            self.limits.max_depth
+                        )));
+                    }
+                    TypedDecoder::Array(ArrayDecoder::new(self.limits, self.depth + 1))
+                }
                 RESP_TYPE_INTEGER => TypedDecoder::Integer(IntegerDecoder::default()),
                 RESP_TYPE_SIMPLE_STRING => TypedDecoder::String(StringDecoder::default()),
                 RESP_TYPE_ERROR => TypedDecoder::Error(StringDecoder::default()),
-                t => return invalid_data(format!("Invalid value type '{}'", t)),
+                t => {
+                    return Err(RespError::invalid_data(format!(
+                        "Invalid value type '{}'",
+                        t
+                    )));
+                }
             };
             input.advance(1);
             self.decoder = Some(decoder);
@@ -616,6 +706,12 @@ impl ValueDecoder {
             self.decoder = None;
         }
         Ok(result)
+    }
+}
+
+impl Default for ValueDecoder {
+    fn default() -> Self {
+        ValueDecoder::new(DecodeLimits::default())
     }
 }
 
@@ -657,14 +753,17 @@ mod tests {
 
     #[test]
     fn test_simple_string() {
-        test_codec(b"+OK\r\n"[..].into(), Value::String("OK".into()));
+        test_codec(
+            b"+OK\r\n"[..].into(),
+            Value::Simple(Bytes::from_static(b"OK")),
+        );
     }
 
     #[test]
     fn test_error() {
         test_codec(
             b"-Error message\r\n"[..].into(),
-            Value::Error("Error message".into()),
+            Value::Error(Bytes::from_static(b"Error message")),
         );
     }
 
@@ -677,9 +776,12 @@ mod tests {
     fn test_bulk_string() {
         test_codec(
             b"$6\r\nfoobar\r\n"[..].into(),
-            Value::Bulk(b"foobar"[..].into()),
+            Value::Bulk(Bytes::from_static(b"foobar")),
         );
-        test_codec(b"$0\r\n\r\n"[..].into(), Value::Bulk(b""[..].into()));
+        test_codec(
+            b"$0\r\n\r\n"[..].into(),
+            Value::Bulk(Bytes::from_static(b"")),
+        );
         test_codec(b"$-1\r\n"[..].into(), Value::Null);
     }
 
@@ -689,8 +791,8 @@ mod tests {
         test_codec(
             b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"[..].into(),
             Value::Array(vec![
-                Value::Bulk(b"foo"[..].into()),
-                Value::Bulk(b"bar"[..].into()),
+                Value::Bulk(Bytes::from_static(b"foo")),
+                Value::Bulk(Bytes::from_static(b"bar")),
             ]),
         );
         test_codec(
@@ -708,8 +810,47 @@ mod tests {
                 Value::Integer(2),
                 Value::Integer(3),
                 Value::Integer(4),
-                Value::Bulk(b"foobar"[..].into()),
+                Value::Bulk(Bytes::from_static(b"foobar")),
             ]),
         );
+    }
+
+    #[test]
+    fn test_bulk_limit() {
+        let limits = DecodeLimits {
+            max_bulk_len: 3,
+            max_array_len: 1024,
+            max_depth: 16,
+        };
+        let mut decoder = ValueDecoder::new(limits);
+        let mut input = BytesMut::from(&b"$4\r\ntest\r\n"[..]);
+        let err = decoder.try_decode(&mut input).unwrap_err();
+        assert!(matches!(err, RespError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_array_limit() {
+        let limits = DecodeLimits {
+            max_bulk_len: 1024,
+            max_array_len: 1,
+            max_depth: 16,
+        };
+        let mut decoder = ValueDecoder::new(limits);
+        let mut input = BytesMut::from(&b"*2\r\n:1\r\n:2\r\n"[..]);
+        let err = decoder.try_decode(&mut input).unwrap_err();
+        assert!(matches!(err, RespError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_depth_limit() {
+        let limits = DecodeLimits {
+            max_bulk_len: 1024,
+            max_array_len: 1024,
+            max_depth: 1,
+        };
+        let mut decoder = ValueDecoder::new(limits);
+        let mut input = BytesMut::from(&b"*1\r\n*1\r\n:1\r\n"[..]);
+        let err = decoder.try_decode(&mut input).unwrap_err();
+        assert!(matches!(err, RespError::InvalidData(_)));
     }
 }

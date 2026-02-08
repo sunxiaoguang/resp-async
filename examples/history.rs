@@ -1,81 +1,56 @@
 extern crate resp_async;
 extern crate tokio;
-#[macro_use]
-extern crate log;
-extern crate simplelog;
 
 use std::env;
 use std::sync::Mutex;
 
-use simplelog::*;
+use bytes::Bytes;
 use tokio::signal;
 
-use resp_async::error::*;
-use resp_async::*;
+use resp_async::error::Result;
+use resp_async::{Cmd, Router, Server, State, Value};
 
 #[derive(Default)]
-struct HistoryServer {
-    connections: Mutex<u64>,
+struct AppState {
+    history: Mutex<Vec<Value>>,
 }
 
-impl EventHandler for HistoryServer {
-    type ClientUserData = i32;
-
-    async fn on_request(
-        &self,
-        peer: &mut PeerContext<Self::ClientUserData>,
-        request: Value,
-    ) -> Result<Value> {
-        let mut resp = None;
-        if let Value::Array(array) = &request {
-            if array.len() == 2 {
-                if let (Some(Value::Bulk(cmd)), Some(Value::Bulk(arg))) =
-                    (array.get(0), array.get(1))
-                {
-                    if cmd == "COMMAND".as_bytes() && arg == "DOCS".as_bytes() {
-                        resp = Some(Value::Array(Vec::new()));
-                    }
-                }
+async fn history(State(state): State<AppState>, Cmd(cmd): Cmd) -> Value {
+    if cmd.name_upper.as_ref() == b"COMMAND" {
+        if let Some(Value::Bulk(arg)) = cmd.args.get(0) {
+            if arg.as_ref() == b"DOCS" {
+                return Value::Array(Vec::new());
             }
         }
-
-        let value = vec![peer.user_data.into(), request].into();
-        if let Some(Value::Array(history)) = peer.get_mut("history") {
-            history.push(value);
-        } else {
-            peer.set("history", vec![value].into());
-        }
-        peer.user_data += 1;
-        Ok(resp.unwrap_or_else(|| Clone::clone(peer.get("history").unwrap())))
     }
 
-    async fn on_connect(&self, id: u64) -> Result<Self::ClientUserData> {
-        let mut connections = self.connections.lock().unwrap();
-        *connections += 1;
-        info!("New connection: {}", id);
-        info!("Total connected users: {}", *connections);
-        Ok(0)
-    }
+    let mut history = state.history.lock().unwrap();
+    let mut entry = Vec::with_capacity(1 + cmd.args.len());
+    entry.push(Value::Bulk(cmd.name));
+    entry.extend(cmd.args);
+    history.push(Value::Array(entry));
+    Value::Array(history.clone())
+}
 
-    async fn on_disconnect(&self, id: u64) {
-        let mut connections = self.connections.lock().unwrap();
-        *connections -= 1;
-        info!("Disconnected connection: {}", id);
-        info!("Total connected users: {}", *connections);
-    }
+async fn ping() -> Value {
+    Value::Simple(Bytes::from_static(b"PONG"))
 }
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
-    let _ = TermLogger::init(
-        LevelFilter::Info,
-        Config::default(),
-        TerminalMode::Mixed,
-        ColorChoice::Auto,
-    );
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:6379".to_string());
-    let mut server = Server::new(HistoryServer::default());
-    server.listen(&addr)?.serve(signal::ctrl_c()).await
+
+    let app = Router::from_state(AppState::default())
+        .route("HISTORY", history)
+        .route("COMMAND", history)
+        .route("PING", ping);
+
+    Server::bind(&addr)
+        .with_graceful_shutdown(async {
+            let _ = signal::ctrl_c().await;
+        })
+        .serve(app)
+        .await
 }

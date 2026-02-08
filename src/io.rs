@@ -1,230 +1,523 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::BytesMut;
-use log::{error, info};
-use std::future::Future;
+use log::error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::task::JoinSet;
 
-use crate::error::*;
-use crate::resp::*;
+use crate::context::{Command, Extensions, PubSubHandle, PushHandle, RequestContext};
+use crate::error::Result;
+use crate::resp::{DecodeLimits, Value, ValueDecoder};
+use crate::response::{IntoResponse, RespError};
+use crate::router::Router;
 
-const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
-
-#[derive(Debug)]
-pub struct PeerContext<T>
-where
-    T: Default,
-{
-    peer: SocketAddr,
-    local: SocketAddr,
-    ctx: HashMap<String, Value>,
-    pub user_data: T,
+/// Server configuration for limits and runtime behavior.
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub max_frame_size: usize,
+    pub max_bulk_len: usize,
+    pub max_array_len: usize,
+    pub max_depth: usize,
+    pub max_inflight_requests: usize,
+    pub max_connections: usize,
+    pub read_timeout: Option<Duration>,
+    pub write_timeout: Option<Duration>,
+    pub idle_timeout: Option<Duration>,
+    pub push_queue_len: usize,
+    pub response_queue_len: usize,
+    pub write_batch_bytes: usize,
+    pub tcp_nodelay: bool,
+    pub backlog: Option<u32>,
 }
 
-impl<T> PeerContext<T>
-where
-    T: Default,
-{
-    pub fn set<K>(&mut self, key: K, value: Value) -> Option<Value>
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_frame_size: 1 << 20,
+            max_bulk_len: 1 << 20,
+            max_array_len: 1024,
+            max_depth: 16,
+            max_inflight_requests: 128,
+            max_connections: 1024,
+            read_timeout: None,
+            write_timeout: None,
+            idle_timeout: None,
+            push_queue_len: 1024,
+            response_queue_len: 1024,
+            write_batch_bytes: 8 * 1024,
+            tcp_nodelay: true,
+            backlog: None,
+        }
+    }
+}
+
+/// Builder for [`ServerConfig`].
+#[derive(Clone, Debug)]
+pub struct ServerConfigBuilder {
+    cfg: ServerConfig,
+}
+
+impl ServerConfig {
+    pub fn builder() -> ServerConfigBuilder {
+        ServerConfigBuilder {
+            cfg: ServerConfig::default(),
+        }
+    }
+}
+
+impl ServerConfigBuilder {
+    /// Set the maximum total frame size (bytes).
+    pub fn max_frame_size(mut self, value: usize) -> Self {
+        self.cfg.max_frame_size = value.max(1);
+        self
+    }
+
+    /// Set the maximum bulk string length (bytes).
+    pub fn max_bulk_len(mut self, value: usize) -> Self {
+        self.cfg.max_bulk_len = value.max(1);
+        self
+    }
+
+    /// Set the maximum array length (elements).
+    pub fn max_array_len(mut self, value: usize) -> Self {
+        self.cfg.max_array_len = value.max(1);
+        self
+    }
+
+    /// Set the maximum nesting depth.
+    pub fn max_depth(mut self, value: usize) -> Self {
+        self.cfg.max_depth = value.max(1);
+        self
+    }
+
+    /// Set the maximum number of buffered in-flight requests.
+    pub fn max_inflight_requests(mut self, value: usize) -> Self {
+        self.cfg.max_inflight_requests = value.max(1);
+        self
+    }
+
+    /// Set the maximum number of concurrent connections.
+    pub fn max_connections(mut self, value: usize) -> Self {
+        self.cfg.max_connections = value.max(1);
+        self
+    }
+
+    /// Set the read timeout for socket reads.
+    pub fn read_timeout(mut self, value: Option<Duration>) -> Self {
+        self.cfg.read_timeout = value;
+        self
+    }
+
+    /// Set the write timeout for socket writes.
+    pub fn write_timeout(mut self, value: Option<Duration>) -> Self {
+        self.cfg.write_timeout = value;
+        self
+    }
+
+    /// Set the idle timeout for connections.
+    pub fn idle_timeout(mut self, value: Option<Duration>) -> Self {
+        self.cfg.idle_timeout = value;
+        self
+    }
+
+    /// Set the push queue length.
+    pub fn push_queue_len(mut self, value: usize) -> Self {
+        self.cfg.push_queue_len = value.max(1);
+        self
+    }
+
+    /// Set the response queue length.
+    pub fn response_queue_len(mut self, value: usize) -> Self {
+        self.cfg.response_queue_len = value.max(1);
+        self
+    }
+
+    /// Set the write batch size (bytes).
+    pub fn write_batch_bytes(mut self, value: usize) -> Self {
+        self.cfg.write_batch_bytes = value.max(1);
+        self
+    }
+
+    /// Enable or disable TCP_NODELAY.
+    pub fn tcp_nodelay(mut self, value: bool) -> Self {
+        self.cfg.tcp_nodelay = value;
+        self
+    }
+
+    /// Set the listener backlog (may be ignored depending on platform).
+    pub fn backlog(mut self, value: Option<u32>) -> Self {
+        self.cfg.backlog = value;
+        self
+    }
+
+    /// Finalize the configuration.
+    pub fn build(self) -> ServerConfig {
+        self.cfg
+    }
+}
+
+/// Server builder for configuring the runtime.
+pub struct ServerBuilder {
+    addr: String,
+    cfg: ServerConfig,
+    shutdown: Option<BoxFuture>,
+}
+
+type BoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+impl ServerBuilder {
+    /// Apply a custom server configuration.
+    pub fn with_config(mut self, cfg: ServerConfig) -> Self {
+        self.cfg = cfg;
+        self
+    }
+
+    /// Provide a future to trigger graceful shutdown.
+    pub fn with_graceful_shutdown<F>(mut self, fut: F) -> Self
     where
-        K: Into<String>,
+        F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.ctx.insert(key.into(), value)
+        self.shutdown = Some(Box::pin(fut));
+        self
     }
 
-    pub fn contains_key(&self, key: &str) -> bool {
-        self.ctx.contains_key(key)
+    pub async fn serve<State>(self, app: Router<State>) -> Result<()>
+    where
+        State: Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind(&self.addr).await?;
+        self.serve_with_listener(listener, app).await
     }
 
-    pub fn get(&mut self, key: &str) -> Option<&Value> {
-        self.ctx.get(key)
-    }
-
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
-        self.ctx.get_mut(key)
-    }
-
-    pub fn peer_addr(&self) -> &SocketAddr {
-        &self.peer
-    }
-
-    pub fn local_addr(&self) -> &SocketAddr {
-        &self.local
-    }
-}
-
-pub trait EventHandler {
-    type ClientUserData: Default + Send + Sync;
-
-    fn on_request(
-        &self,
-        peer: &mut PeerContext<Self::ClientUserData>,
-        request: Value,
-    ) -> impl Future<Output = Result<Value>> + Send;
-    fn on_connect(&self, _id: u64) -> impl Future<Output = Result<Self::ClientUserData>> + Send {
-        async { Ok(Self::ClientUserData::default()) }
-    }
-    fn on_disconnect(&self, _id: u64) -> impl Future<Output = ()> + Send {
-        async {}
-    }
-}
-
-struct Shutdown {
-    is_shutdown: bool,
-    notify: broadcast::Receiver<()>,
-}
-
-impl Shutdown {
-    pub(crate) fn new(notify: broadcast::Receiver<()>) -> Shutdown {
-        Shutdown {
-            is_shutdown: false,
-            notify,
-        }
-    }
-
-    pub(crate) async fn recv(&mut self) {
-        if self.is_shutdown {
-            return;
-        }
-        let _ = self.notify.recv().await;
-        self.is_shutdown = true;
-    }
-
-    pub(crate) fn is_shutdown(&self) -> bool {
-        self.is_shutdown
-    }
-}
-
-pub struct Server<H>
-where
-    H: EventHandler + Send + Sync + 'static,
-{
-    handler: Arc<H>,
-    address: String,
-    client_id: Arc<AtomicU64>,
-}
-
-impl<H> Server<H>
-where
-    H: EventHandler + Send + Sync + 'static,
-{
-    pub fn new(handler: H) -> Self {
-        Server {
-            handler: Arc::new(handler),
-            address: DEFAULT_ADDRESS.into(),
-            client_id: Arc::new(AtomicU64::default()),
-        }
-    }
-
-    pub fn listen(&mut self, addr: impl Into<String>) -> Result<&mut Self> {
-        self.address = addr.into();
-        Ok(self)
-    }
-
-    async fn run_client_loop(
-        user_data: H::ClientUserData,
-        handler: Arc<H>,
-        mut socket: TcpStream,
-    ) -> Result<()> {
-        let mut client = PeerContext {
-            peer: socket.peer_addr()?,
-            local: socket.local_addr()?,
-            ctx: HashMap::new(),
-            user_data,
-        };
-        let mut rd = BytesMut::new();
-        let mut wr = BytesMut::new();
-        let mut decoder = ValueDecoder::default();
-        loop {
-            if let Some(value) = decoder.try_decode(&mut rd)? {
-                handler
-                    .on_request(&mut client, value)
-                    .await?
-                    .encode(&mut wr);
-                socket.write_all(&wr).await?;
-                wr.clear();
-                socket.flush().await?;
-            }
-
-            if 0 == socket.read_buf(&mut rd).await? && rd.is_empty() {
-                return Ok(());
-            }
-        }
-    }
-
-    async fn run_client_hooks(id: u64, handler: Arc<H>, socket: TcpStream) -> Result<()> {
-        let user_data = handler.on_connect(id).await?;
-        let result = Self::run_client_loop(user_data, Arc::clone(&handler), socket).await;
-        handler.on_disconnect(id).await;
-        result
-    }
-
-    async fn run_client(
-        id: u64,
-        handler: Arc<H>,
-        socket: TcpStream,
-        notify_shutdown: broadcast::Sender<()>,
-        _shutdown_complete_tx: mpsc::Sender<()>,
-    ) -> Result<()> {
-        let mut shutdown = Shutdown::new(notify_shutdown.subscribe());
-        tokio::select! {
-            res = Self::run_client_hooks(id, handler, socket) => { res }
-            _ = shutdown.recv() => { Ok(()) }
-        }
-    }
-
-    async fn run_accept_loop(
-        &mut self,
+    /// Serve using a pre-bound listener (useful for tests).
+    pub async fn serve_with_listener<State>(
+        self,
         listener: TcpListener,
-        notify_shutdown: broadcast::Sender<()>,
-        shutdown_complete_tx: mpsc::Sender<()>,
-    ) -> Result<()> {
-        let mut shutdown = Shutdown::new(notify_shutdown.subscribe());
-        while !shutdown.is_shutdown() {
-            tokio::select! {
-                res = listener.accept() => {
-                    if let Ok((socket, _)) = res {
-                        let handler = Arc::clone(&self.handler);
-                        let client_id = Arc::clone(&self.client_id);
-                        let notify_shutdown = Clone::clone(&notify_shutdown);
-                        let shutdown_complete_tx = Clone::clone(&shutdown_complete_tx);
-                        tokio::spawn(async move {
-                            Self::run_client(client_id.fetch_add(1, Ordering::AcqRel), handler, socket, notify_shutdown, shutdown_complete_tx).await
-                        });
+        app: Router<State>,
+    ) -> Result<()>
+    where
+        State: Send + Sync + 'static,
+    {
+        if let Some(backlog) = self.cfg.backlog {
+            let _ = backlog;
+        }
+        run_server(listener, app, self.cfg, self.shutdown).await
+    }
+}
+
+/// A RESP server.
+pub struct Server;
+
+impl Server {
+    /// Bind a server to the provided address.
+    pub fn bind(addr: impl Into<String>) -> ServerBuilder {
+        ServerBuilder {
+            addr: addr.into(),
+            cfg: ServerConfig::default(),
+            shutdown: None,
+        }
+    }
+}
+
+async fn run_server<State>(
+    listener: TcpListener,
+    app: Router<State>,
+    cfg: ServerConfig,
+    shutdown: Option<BoxFuture>,
+) -> Result<()>
+where
+    State: Send + Sync + 'static,
+{
+    let (shutdown_tx, _) = broadcast::channel(1);
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let mut join_set = JoinSet::new();
+    let semaphore = Arc::new(Semaphore::new(cfg.max_connections));
+    let client_id = Arc::new(AtomicU64::new(1));
+
+    let shutdown_fut = async move {
+        if let Some(fut) = shutdown {
+            fut.await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let mut shutdown_fut = Box::pin(shutdown_fut);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_fut => {
+                break;
+            }
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+            accept = listener.accept() => {
+                let (socket, _) = match accept {
+                    Ok(value) => value,
+                    Err(err) => {
+                        error!("accept error: {:?}", err);
+                        continue;
                     }
-                },
-                _ = shutdown.recv() => {}
+                };
+
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        continue;
+                    }
+                };
+
+                if cfg.tcp_nodelay {
+                    let _ = socket.set_nodelay(true);
+                }
+
+                let handler = app.clone();
+                let cfg = cfg.clone();
+                let shutdown_rx = shutdown_tx.subscribe();
+                let id = client_id.fetch_add(1, Ordering::AcqRel);
+                join_set.spawn(async move {
+                    let _permit = permit;
+                    if let Err(err) = run_connection(id, socket, handler, cfg, shutdown_rx).await {
+                        error!("connection error: {:?}", err);
+                    }
+                });
             }
         }
-        Ok(())
     }
 
-    pub async fn serve(&mut self, shutdown: impl Future) -> Result<()> {
-        let listener = TcpListener::bind(&self.address).await?;
+    let _ = shutdown_tx.send(());
 
-        let (notify_shutdown, _) = broadcast::channel(1);
-        let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
+    while let Some(res) = join_set.join_next().await {
+        if let Err(err) = res {
+            error!("connection task error: {:?}", err);
+        }
+    }
 
-        tokio::select! {
-            res = self.run_accept_loop(listener, Clone::clone(&notify_shutdown), Clone::clone(&shutdown_complete_tx)) => {
-                if let Err(err) = res {
-                    error!("Failed to accept {:?}", err);
+    Ok(())
+}
+
+async fn run_connection<State>(
+    id: u64,
+    socket: TcpStream,
+    app: Router<State>,
+    cfg: ServerConfig,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<()>
+where
+    State: Send + Sync + 'static,
+{
+    let peer_addr = socket.peer_addr()?;
+    let local_addr = socket.local_addr()?;
+    let (mut reader, writer) = socket.into_split();
+
+    let (resp_tx, resp_rx) = mpsc::channel(cfg.response_queue_len);
+    let (push_tx, push_rx) = mpsc::channel(cfg.push_queue_len);
+    let (close_tx, mut close_rx) = mpsc::channel(1);
+
+    let push_handle = PushHandle::new(push_tx, close_tx);
+    let pubsub_count = Arc::new(AtomicUsize::new(0));
+    let pubsub_handle = PubSubHandle::new(pubsub_count.clone());
+    let extensions = Extensions::default();
+
+    let writer_cfg = cfg.clone();
+    let writer_task =
+        tokio::spawn(async move { writer_loop(writer, resp_rx, push_rx, writer_cfg).await });
+
+    let mut rd = BytesMut::with_capacity(4096);
+    let mut decoder = ValueDecoder::new(DecodeLimits {
+        max_bulk_len: cfg.max_bulk_len,
+        max_array_len: cfg.max_array_len,
+        max_depth: cfg.max_depth,
+    });
+    let mut inflight = VecDeque::new();
+
+    loop {
+        while inflight.len() < cfg.max_inflight_requests {
+            match decoder.try_decode(&mut rd) {
+                Ok(Some(value)) => {
+                    let command = match Command::from_value(value) {
+                        Ok(cmd) => cmd,
+                        Err(err) => {
+                            let _ = resp_tx.send(err.into_response()).await;
+                            return Ok(());
+                        }
+                    };
+
+                    if pubsub_count.load(Ordering::Acquire) > 0
+                        && !is_pubsub_allowed(&command.name_upper)
+                    {
+                        let err = RespError::invalid_data(
+                            "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context",
+                        );
+                        let _ = resp_tx.send(err.into_response()).await;
+                        continue;
+                    }
+
+                    inflight.push_back(command);
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let _ = resp_tx.send(err.into_response()).await;
+                    return Ok(());
                 }
             }
-            _ = shutdown => {
-                info!("shutting down server");
+        }
+
+        if let Some(command) = inflight.pop_front() {
+            let ctx = RequestContext {
+                command,
+                peer_addr,
+                local_addr,
+                client_id: id,
+                extensions: extensions.clone(),
+                push: push_handle.clone(),
+                pubsub: pubsub_handle.clone(),
+            };
+            let response = app.call(ctx).await;
+            if resp_tx.send(response).await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        tokio::select! {
+            _ = shutdown.recv() => {
+                break;
+            }
+            _ = close_rx.recv() => {
+                let _ = resp_tx.try_send(RespError::invalid_data("ERR client output buffer limit reached").into_response());
+                break;
+            }
+            read = read_more(&mut reader, &mut rd, cfg.read_timeout, cfg.idle_timeout) => {
+                let read = read?;
+                if read == 0 {
+                    if rd.is_empty() {
+                        break;
+                    }
+                    let _ = resp_tx.send(RespError::invalid_data("ERR unexpected EOF").into_response()).await;
+                    break;
+                }
+                if rd.len() > cfg.max_frame_size {
+                    let _ = resp_tx.send(RespError::invalid_data("ERR max frame size exceeded").into_response()).await;
+                    break;
+                }
+            }
+        }
+    }
+
+    drop(resp_tx);
+    drop(push_handle);
+
+    let _ = writer_task.await;
+    Ok(())
+}
+
+async fn read_more(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    buf: &mut BytesMut,
+    read_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+) -> Result<usize> {
+    let fut = reader.read_buf(buf);
+    let timeout = idle_timeout.or(read_timeout);
+    if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+        }
+    } else {
+        fut.await
+    }
+}
+
+async fn writer_loop(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut resp_rx: mpsc::Receiver<Value>,
+    mut push_rx: mpsc::Receiver<Value>,
+    cfg: ServerConfig,
+) -> Result<()> {
+    let mut buf = BytesMut::with_capacity(cfg.write_batch_bytes);
+    let mut resp_closed = false;
+    let mut push_closed = false;
+
+    loop {
+        let mut drained_response = false;
+        while let Ok(value) = resp_rx.try_recv() {
+            drained_response = true;
+            value.encode(&mut buf);
+            if buf.len() >= cfg.write_batch_bytes {
+                flush_buffer(&mut writer, &mut buf, cfg.write_timeout).await?;
+            }
+        }
+        if !drained_response {
+            while let Ok(value) = push_rx.try_recv() {
+                value.encode(&mut buf);
+                if buf.len() >= cfg.write_batch_bytes {
+                    break;
+                }
+            }
+        }
+        if !buf.is_empty() {
+            flush_buffer(&mut writer, &mut buf, cfg.write_timeout).await?;
+        }
+
+        if resp_closed && push_closed {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            res = resp_rx.recv() => {
+                match res {
+                    Some(value) => value.encode(&mut buf),
+                    None => resp_closed = true,
+                }
+            }
+            res = push_rx.recv() => {
+                match res {
+                    Some(value) => value.encode(&mut buf),
+                    None => push_closed = true,
+                }
             }
         }
 
-        drop(notify_shutdown);
-        drop(shutdown_complete_tx);
-
-        let _ = shutdown_complete_rx.recv().await;
-        Ok(())
+        if !buf.is_empty() {
+            flush_buffer(&mut writer, &mut buf, cfg.write_timeout).await?;
+        }
     }
+
+    Ok(())
+}
+
+async fn flush_buffer(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    buf: &mut BytesMut,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let write = writer.write_all(buf);
+    if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout, write).await {
+            Ok(res) => res?,
+            Err(_) => return Err(std::io::ErrorKind::TimedOut.into()),
+        }
+    } else {
+        write.await?;
+    }
+    buf.clear();
+    Ok(())
+}
+
+fn is_pubsub_allowed(cmd: &bytes::Bytes) -> bool {
+    matches!(
+        cmd.as_ref(),
+        b"SUBSCRIBE" | b"PSUBSCRIBE" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PING" | b"QUIT"
+    )
 }
