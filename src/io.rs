@@ -9,7 +9,7 @@ use log::error;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::context::{Command, Extensions, PubSubHandle, PushHandle, RequestContext};
@@ -18,7 +18,7 @@ use crate::resp::{DecodeLimits, Value, ValueDecoder};
 use crate::response::{IntoResponse, RespError};
 use crate::router::Router;
 
-/// Per-connection metadata passed to hooks.
+/// Per-connection metadata passed to hooks and extension factories.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectionInfo {
     pub id: u64,
@@ -51,6 +51,12 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.hooks.on_connection_close(self.info);
     }
+}
+
+type ExtensionsFactory = Arc<dyn Fn(ConnectionInfo) -> Extensions + Send + Sync + 'static>;
+
+fn default_extensions(_info: ConnectionInfo) -> Extensions {
+    Extensions::default()
 }
 
 /// Server configuration for limits and runtime behavior.
@@ -204,6 +210,7 @@ pub struct ServerBuilder {
     cfg: ServerConfig,
     shutdown: Option<BoxFuture>,
     hooks: Arc<dyn ServerHooks>,
+    extensions_factory: ExtensionsFactory,
 }
 
 type BoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
@@ -233,6 +240,18 @@ impl ServerBuilder {
         self
     }
 
+    /// Provide per-connection extensions for request contexts.
+    ///
+    /// The factory is invoked once per connection and its `Extensions` are
+    /// cloned into each `RequestContext` for that connection.
+    pub fn with_connection_extensions<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(ConnectionInfo) -> Extensions + Send + Sync + 'static,
+    {
+        self.extensions_factory = Arc::new(factory);
+        self
+    }
+
     pub async fn serve<State>(self, app: Router<State>) -> Result<()>
     where
         State: Send + Sync + 'static,
@@ -254,7 +273,15 @@ impl ServerBuilder {
     where
         State: Send + Sync + 'static,
     {
-        run_server(listener, app, self.cfg, self.shutdown, self.hooks).await
+        run_server(
+            listener,
+            app,
+            self.cfg,
+            self.shutdown,
+            self.hooks,
+            self.extensions_factory,
+        )
+        .await
     }
 }
 
@@ -269,6 +296,7 @@ impl Server {
             cfg: ServerConfig::default(),
             shutdown: None,
             hooks: Arc::new(NoopServerHooks),
+            extensions_factory: Arc::new(default_extensions),
         }
     }
 }
@@ -294,6 +322,7 @@ async fn run_server<State>(
     cfg: ServerConfig,
     shutdown: Option<BoxFuture>,
     hooks: Arc<dyn ServerHooks>,
+    extensions_factory: ExtensionsFactory,
 ) -> Result<()>
 where
     State: Send + Sync + 'static,
@@ -347,10 +376,20 @@ where
                 let shutdown_rx = shutdown_tx.subscribe();
                 let id = client_id.fetch_add(1, Ordering::AcqRel);
                 let hooks = Arc::clone(&hooks);
+                let extensions_factory = Arc::clone(&extensions_factory);
                 join_set.spawn(async move {
                     let _permit = permit;
                     if let Err(err) =
-                        run_connection(id, socket, handler, cfg, shutdown_rx, hooks.clone()).await
+                        run_connection(
+                            id,
+                            socket,
+                            handler,
+                            cfg,
+                            shutdown_rx,
+                            hooks.clone(),
+                            extensions_factory,
+                        )
+                        .await
                     {
                         error!("connection error: {:?}", err);
                         hooks.on_io_error(&err);
@@ -378,6 +417,7 @@ async fn run_connection<State>(
     cfg: ServerConfig,
     mut shutdown: broadcast::Receiver<()>,
     hooks: Arc<dyn ServerHooks>,
+    extensions_factory: ExtensionsFactory,
 ) -> Result<()>
 where
     State: Send + Sync + 'static,
@@ -399,15 +439,18 @@ where
     let (resp_tx, resp_rx) = mpsc::channel(cfg.response_queue_len);
     let (push_tx, push_rx) = mpsc::channel(cfg.push_queue_len);
     let (close_tx, mut close_rx) = mpsc::channel(1);
+    let (writer_close_tx, writer_close_rx) = oneshot::channel();
+    let mut writer_close_tx = Some(writer_close_tx);
 
     let push_handle = PushHandle::new(push_tx, close_tx);
     let pubsub_count = Arc::new(AtomicUsize::new(0));
     let pubsub_handle = PubSubHandle::new(pubsub_count.clone());
-    let extensions = Extensions::default();
+    let extensions = (extensions_factory)(info);
 
     let writer_cfg = cfg.clone();
-    let writer_task =
-        tokio::spawn(async move { writer_loop(writer, resp_rx, push_rx, writer_cfg).await });
+    let writer_task = tokio::spawn(async move {
+        writer_loop(writer, resp_rx, push_rx, writer_close_rx, writer_cfg).await
+    });
 
     let mut rd = BytesMut::with_capacity(4096);
     let mut decoder = ValueDecoder::new(DecodeLimits {
@@ -426,6 +469,7 @@ where
                         Err(err) => {
                             hooks.on_protocol_error(&err);
                             let _ = resp_tx.send(err.into_response()).await;
+                            signal_writer_close(&mut writer_close_tx);
                             return Ok(());
                         }
                     };
@@ -448,12 +492,14 @@ where
                 Err(err) => {
                     hooks.on_protocol_error(&err);
                     let _ = resp_tx.send(err.into_response()).await;
+                    signal_writer_close(&mut writer_close_tx);
                     return Ok(());
                 }
             }
         }
 
         if let Some(command) = inflight.pop_front() {
+            let close_after = command.name_upper.as_ref() == b"QUIT";
             let ctx = RequestContext {
                 command,
                 peer_addr,
@@ -467,40 +513,50 @@ where
             if resp_tx.send(response).await.is_err() {
                 break;
             }
+            if close_after {
+                signal_writer_close(&mut writer_close_tx);
+                break;
+            }
             continue;
         }
 
         tokio::select! {
             _ = shutdown.recv() => {
+                signal_writer_close(&mut writer_close_tx);
                 break;
             }
             _ = close_rx.recv() => {
                 let err = RespError::invalid_data("ERR client output buffer limit reached");
                 hooks.on_protocol_error(&err);
                 let _ = resp_tx.try_send(err.into_response());
+                signal_writer_close(&mut writer_close_tx);
                 break;
             }
             read = read_more(&mut reader, &mut rd, cfg.read_timeout, cfg.idle_timeout) => {
                 let read = read?;
                 if read == 0 {
                     if rd.is_empty() {
+                        signal_writer_close(&mut writer_close_tx);
                         break;
                     }
                     let err = RespError::invalid_data("ERR unexpected EOF");
                     hooks.on_protocol_error(&err);
                     let _ = resp_tx.send(err.into_response()).await;
+                    signal_writer_close(&mut writer_close_tx);
                     break;
                 }
                 if rd.len() > cfg.max_frame_size {
                     let err = RespError::invalid_data("ERR max frame size exceeded");
                     hooks.on_protocol_error(&err);
                     let _ = resp_tx.send(err.into_response()).await;
+                    signal_writer_close(&mut writer_close_tx);
                     break;
                 }
             }
         }
     }
 
+    signal_writer_close(&mut writer_close_tx);
     drop(resp_tx);
     drop(push_handle);
 
@@ -530,11 +586,13 @@ async fn writer_loop(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut resp_rx: mpsc::Receiver<Value>,
     mut push_rx: mpsc::Receiver<Value>,
+    mut close_rx: oneshot::Receiver<()>,
     cfg: ServerConfig,
 ) -> Result<()> {
     let mut buf = BytesMut::with_capacity(cfg.write_batch_bytes);
     let mut resp_closed = false;
     let mut push_closed = false;
+    let mut closing = false;
 
     loop {
         let mut drained_response = false;
@@ -545,7 +603,7 @@ async fn writer_loop(
                 flush_buffer(&mut writer, &mut buf, cfg.write_timeout).await?;
             }
         }
-        if !drained_response {
+        if !drained_response && !closing {
             while let Ok(value) = push_rx.try_recv() {
                 value.encode(&mut buf);
                 if buf.len() >= cfg.write_batch_bytes {
@@ -557,19 +615,26 @@ async fn writer_loop(
             flush_buffer(&mut writer, &mut buf, cfg.write_timeout).await?;
         }
 
+        if closing {
+            break;
+        }
+
         if resp_closed && push_closed {
             break;
         }
 
         tokio::select! {
             biased;
+            _ = &mut close_rx => {
+                closing = true;
+            }
             res = resp_rx.recv() => {
                 match res {
                     Some(value) => value.encode(&mut buf),
                     None => resp_closed = true,
                 }
             }
-            res = push_rx.recv() => {
+            res = push_rx.recv(), if !closing => {
                 match res {
                     Some(value) => value.encode(&mut buf),
                     None => push_closed = true,
@@ -583,6 +648,12 @@ async fn writer_loop(
     }
 
     Ok(())
+}
+
+fn signal_writer_close(tx: &mut Option<oneshot::Sender<()>>) {
+    if let Some(tx) = tx.take() {
+        let _ = tx.send(());
+    }
 }
 
 async fn flush_buffer(
