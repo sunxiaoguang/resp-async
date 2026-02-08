@@ -35,36 +35,36 @@ pub trait IntoHandler<State, Args>: Send + Sync + 'static {
 }
 
 struct HandlerFn0<F> {
-    f: F,
+    f: Arc<F>,
 }
 
 struct HandlerFn1<F, T1> {
-    f: F,
+    f: Arc<F>,
     _t1: PhantomData<fn(T1)>,
 }
 
 struct HandlerFn2<F, T1, T2> {
-    f: F,
+    f: Arc<F>,
     _t: PhantomData<fn(T1, T2)>,
 }
 
 struct HandlerFn3<F, T1, T2, T3> {
-    f: F,
+    f: Arc<F>,
     _t: PhantomData<fn(T1, T2, T3)>,
 }
 
 struct HandlerFn4<F, T1, T2, T3, T4> {
-    f: F,
+    f: Arc<F>,
     _t: PhantomData<fn(T1, T2, T3, T4)>,
 }
 
 struct HandlerFn5<F, T1, T2, T3, T4, T5> {
-    f: F,
+    f: Arc<F>,
     _t: PhantomData<fn(T1, T2, T3, T4, T5)>,
 }
 
 struct HandlerFn6<F, T1, T2, T3, T4, T5, T6> {
-    f: F,
+    f: Arc<F>,
     _t: PhantomData<fn(T1, T2, T3, T4, T5, T6)>,
 }
 
@@ -73,14 +73,14 @@ macro_rules! impl_handler {
         #[allow(non_snake_case)]
         impl<State, F, Fut, R, $( $ty ),*> Handler<State> for $name<F, $( $ty ),*>
         where
-            F: Copy + Send + Sync + 'static + Fn($( $ty ),*) -> Fut,
+            F: Send + Sync + 'static + Fn($( $ty ),*) -> Fut,
             Fut: Future<Output = R> + Send + 'static,
             R: IntoResponse,
             $( $ty: FromRequest<State> + Send + 'static, )*
             State: Send + Sync + 'static,
         {
             fn call(&self, mut ctx: RequestContext, state: Arc<State>) -> BoxFuture<Response> {
-                let f = self.f;
+                let f = Arc::clone(&self.f);
                 Box::pin(async move {
                     $(
                         let $ty = match $ty::from_request(&mut ctx, &state).await {
@@ -98,13 +98,13 @@ macro_rules! impl_handler {
 
 impl<State, F, Fut, R> Handler<State> for HandlerFn0<F>
 where
-    F: Copy + Send + Sync + 'static + Fn() -> Fut,
+    F: Send + Sync + 'static + Fn() -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     State: Send + Sync + 'static,
 {
     fn call(&self, _ctx: RequestContext, _state: Arc<State>) -> BoxFuture<Response> {
-        let f = self.f;
+        let f = Arc::clone(&self.f);
         Box::pin(async move { f().await.into_response() })
     }
 }
@@ -118,19 +118,19 @@ impl_handler!(HandlerFn6, T1, T2, T3, T4, T5, T6);
 
 impl<State, F, Fut, R> IntoHandler<State, ()> for F
 where
-    F: Copy + Send + Sync + 'static + Fn() -> Fut,
+    F: Send + Sync + 'static + Fn() -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     State: Send + Sync + 'static,
 {
     fn into_handler(self) -> Arc<dyn Handler<State>> {
-        Arc::new(HandlerFn0 { f: self })
+        Arc::new(HandlerFn0 { f: Arc::new(self) })
     }
 }
 
 impl<State, F, Fut, R, T1> IntoHandler<State, (T1,)> for F
 where
-    F: Copy + Send + Sync + 'static + Fn(T1) -> Fut,
+    F: Send + Sync + 'static + Fn(T1) -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     T1: FromRequest<State> + Send + 'static,
@@ -138,7 +138,7 @@ where
 {
     fn into_handler(self) -> Arc<dyn Handler<State>> {
         Arc::new(HandlerFn1 {
-            f: self,
+            f: Arc::new(self),
             _t1: PhantomData,
         })
     }
@@ -146,7 +146,7 @@ where
 
 impl<State, F, Fut, R, T1, T2> IntoHandler<State, (T1, T2)> for F
 where
-    F: Copy + Send + Sync + 'static + Fn(T1, T2) -> Fut,
+    F: Send + Sync + 'static + Fn(T1, T2) -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     T1: FromRequest<State> + Send + 'static,
@@ -155,7 +155,7 @@ where
 {
     fn into_handler(self) -> Arc<dyn Handler<State>> {
         Arc::new(HandlerFn2 {
-            f: self,
+            f: Arc::new(self),
             _t: PhantomData,
         })
     }
@@ -163,7 +163,7 @@ where
 
 impl<State, F, Fut, R, T1, T2, T3> IntoHandler<State, (T1, T2, T3)> for F
 where
-    F: Copy + Send + Sync + 'static + Fn(T1, T2, T3) -> Fut,
+    F: Send + Sync + 'static + Fn(T1, T2, T3) -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     T1: FromRequest<State> + Send + 'static,
@@ -173,7 +173,7 @@ where
 {
     fn into_handler(self) -> Arc<dyn Handler<State>> {
         Arc::new(HandlerFn3 {
-            f: self,
+            f: Arc::new(self),
             _t: PhantomData,
         })
     }
@@ -181,7 +181,7 @@ where
 
 impl<State, F, Fut, R, T1, T2, T3, T4> IntoHandler<State, (T1, T2, T3, T4)> for F
 where
-    F: Copy + Send + Sync + 'static + Fn(T1, T2, T3, T4) -> Fut,
+    F: Send + Sync + 'static + Fn(T1, T2, T3, T4) -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     T1: FromRequest<State> + Send + 'static,
@@ -192,7 +192,7 @@ where
 {
     fn into_handler(self) -> Arc<dyn Handler<State>> {
         Arc::new(HandlerFn4 {
-            f: self,
+            f: Arc::new(self),
             _t: PhantomData,
         })
     }
@@ -200,7 +200,7 @@ where
 
 impl<State, F, Fut, R, T1, T2, T3, T4, T5> IntoHandler<State, (T1, T2, T3, T4, T5)> for F
 where
-    F: Copy + Send + Sync + 'static + Fn(T1, T2, T3, T4, T5) -> Fut,
+    F: Send + Sync + 'static + Fn(T1, T2, T3, T4, T5) -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     T1: FromRequest<State> + Send + 'static,
@@ -212,7 +212,7 @@ where
 {
     fn into_handler(self) -> Arc<dyn Handler<State>> {
         Arc::new(HandlerFn5 {
-            f: self,
+            f: Arc::new(self),
             _t: PhantomData,
         })
     }
@@ -221,7 +221,7 @@ where
 impl<State, F, Fut, R, T1, T2, T3, T4, T5, T6> IntoHandler<State, (T1, T2, T3, T4, T5, T6)>
     for F
 where
-    F: Copy + Send + Sync + 'static + Fn(T1, T2, T3, T4, T5, T6) -> Fut,
+    F: Send + Sync + 'static + Fn(T1, T2, T3, T4, T5, T6) -> Fut,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
     T1: FromRequest<State> + Send + 'static,
@@ -234,7 +234,7 @@ where
 {
     fn into_handler(self) -> Arc<dyn Handler<State>> {
         Arc::new(HandlerFn6 {
-            f: self,
+            f: Arc::new(self),
             _t: PhantomData,
         })
     }
@@ -298,8 +298,7 @@ where
 
     /// Register a command handler.
     ///
-    /// The handler must be an async function item (or other `fn` pointer) so it
-    /// can be converted into a `fn(...) -> Future` type.
+    /// The handler must be an async function or `Fn` that returns a `Send + 'static` future.
     pub fn route<H, Args>(self, command: &'static str, handler: H) -> Self
     where
         H: IntoHandler<State, Args>,
@@ -541,6 +540,20 @@ mod tests {
         let cmd = Command::new(Bytes::from_static(b"NOPE"), Vec::new());
         let resp = app.call(make_ctx(cmd)).await;
         assert!(matches!(resp, Value::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn route_accepts_capturing_closure() {
+        let payload = Bytes::from_static(b"PONG");
+        let handler = move || {
+            let payload = payload.clone();
+            async move { Value::Simple(payload) }
+        };
+
+        let app: Router<()> = Router::new().route("PING", handler);
+        let cmd = Command::new(Bytes::from_static(b"PING"), Vec::new());
+        let resp = app.call(make_ctx(cmd)).await;
+        assert_eq!(resp, Value::Simple(Bytes::from_static(b"PONG")));
     }
 
     #[tokio::test]

@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
 use log::error;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, broadcast, mpsc};
@@ -15,6 +17,41 @@ use crate::error::Result;
 use crate::resp::{DecodeLimits, Value, ValueDecoder};
 use crate::response::{IntoResponse, RespError};
 use crate::router::Router;
+
+/// Per-connection metadata passed to hooks.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionInfo {
+    pub id: u64,
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
+
+/// Observability hooks for the server runtime.
+pub trait ServerHooks: Send + Sync + 'static {
+    fn on_accept_error(&self, _err: &std::io::Error) {}
+    fn on_connection_open(&self, _info: ConnectionInfo) {}
+    fn on_connection_close(&self, _info: ConnectionInfo) {}
+    fn on_command(&self, _id: u64, _command: &Command) {}
+    fn on_protocol_error(&self, _err: &RespError) {}
+    fn on_io_error(&self, _err: &std::io::Error) {}
+}
+
+/// Default no-op hooks implementation.
+#[derive(Debug, Default, Clone)]
+pub struct NoopServerHooks;
+
+impl ServerHooks for NoopServerHooks {}
+
+struct ConnectionGuard {
+    hooks: Arc<dyn ServerHooks>,
+    info: ConnectionInfo,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.hooks.on_connection_close(self.info);
+    }
+}
 
 /// Server configuration for limits and runtime behavior.
 #[derive(Clone, Debug)]
@@ -166,6 +203,7 @@ pub struct ServerBuilder {
     addr: String,
     cfg: ServerConfig,
     shutdown: Option<BoxFuture>,
+    hooks: Arc<dyn ServerHooks>,
 }
 
 type BoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
@@ -186,11 +224,24 @@ impl ServerBuilder {
         self
     }
 
+    /// Provide observability hooks for the server runtime.
+    pub fn with_hooks<H>(mut self, hooks: H) -> Self
+    where
+        H: ServerHooks,
+    {
+        self.hooks = Arc::new(hooks);
+        self
+    }
+
     pub async fn serve<State>(self, app: Router<State>) -> Result<()>
     where
         State: Send + Sync + 'static,
     {
-        let listener = TcpListener::bind(&self.addr).await?;
+        let listener = if let Some(backlog) = self.cfg.backlog {
+            bind_with_backlog(&self.addr, backlog)?
+        } else {
+            TcpListener::bind(&self.addr).await?
+        };
         self.serve_with_listener(listener, app).await
     }
 
@@ -203,10 +254,7 @@ impl ServerBuilder {
     where
         State: Send + Sync + 'static,
     {
-        if let Some(backlog) = self.cfg.backlog {
-            let _ = backlog;
-        }
-        run_server(listener, app, self.cfg, self.shutdown).await
+        run_server(listener, app, self.cfg, self.shutdown, self.hooks).await
     }
 }
 
@@ -220,8 +268,24 @@ impl Server {
             addr: addr.into(),
             cfg: ServerConfig::default(),
             shutdown: None,
+            hooks: Arc::new(NoopServerHooks),
         }
     }
+}
+
+fn bind_with_backlog(addr: &str, backlog: u32) -> Result<TcpListener> {
+    let mut addrs = addr.to_socket_addrs()?;
+    let addr = addrs.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty bind address")
+    })?;
+    let domain = Domain::for_address(addr);
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(addr))?;
+    let backlog = backlog.max(1).min(i32::MAX as u32) as i32;
+    socket.listen(backlog)?;
+    let listener: std::net::TcpListener = socket.into();
+    Ok(TcpListener::from_std(listener)?)
 }
 
 async fn run_server<State>(
@@ -229,6 +293,7 @@ async fn run_server<State>(
     app: Router<State>,
     cfg: ServerConfig,
     shutdown: Option<BoxFuture>,
+    hooks: Arc<dyn ServerHooks>,
 ) -> Result<()>
 where
     State: Send + Sync + 'static,
@@ -261,6 +326,7 @@ where
                     Ok(value) => value,
                     Err(err) => {
                         error!("accept error: {:?}", err);
+                        hooks.on_accept_error(&err);
                         continue;
                     }
                 };
@@ -280,10 +346,14 @@ where
                 let cfg = cfg.clone();
                 let shutdown_rx = shutdown_tx.subscribe();
                 let id = client_id.fetch_add(1, Ordering::AcqRel);
+                let hooks = Arc::clone(&hooks);
                 join_set.spawn(async move {
                     let _permit = permit;
-                    if let Err(err) = run_connection(id, socket, handler, cfg, shutdown_rx).await {
+                    if let Err(err) =
+                        run_connection(id, socket, handler, cfg, shutdown_rx, hooks.clone()).await
+                    {
                         error!("connection error: {:?}", err);
+                        hooks.on_io_error(&err);
                     }
                 });
             }
@@ -307,12 +377,23 @@ async fn run_connection<State>(
     app: Router<State>,
     cfg: ServerConfig,
     mut shutdown: broadcast::Receiver<()>,
+    hooks: Arc<dyn ServerHooks>,
 ) -> Result<()>
 where
     State: Send + Sync + 'static,
 {
     let peer_addr = socket.peer_addr()?;
     let local_addr = socket.local_addr()?;
+    let info = ConnectionInfo {
+        id,
+        peer_addr,
+        local_addr,
+    };
+    hooks.on_connection_open(info);
+    let _guard = ConnectionGuard {
+        hooks: Arc::clone(&hooks),
+        info,
+    };
     let (mut reader, writer) = socket.into_split();
 
     let (resp_tx, resp_rx) = mpsc::channel(cfg.response_queue_len);
@@ -343,6 +424,7 @@ where
                     let command = match Command::from_value(value) {
                         Ok(cmd) => cmd,
                         Err(err) => {
+                            hooks.on_protocol_error(&err);
                             let _ = resp_tx.send(err.into_response()).await;
                             return Ok(());
                         }
@@ -354,14 +436,17 @@ where
                         let err = RespError::invalid_data(
                             "ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context",
                         );
+                        hooks.on_protocol_error(&err);
                         let _ = resp_tx.send(err.into_response()).await;
                         continue;
                     }
 
+                    hooks.on_command(id, &command);
                     inflight.push_back(command);
                 }
                 Ok(None) => break,
                 Err(err) => {
+                    hooks.on_protocol_error(&err);
                     let _ = resp_tx.send(err.into_response()).await;
                     return Ok(());
                 }
@@ -390,7 +475,9 @@ where
                 break;
             }
             _ = close_rx.recv() => {
-                let _ = resp_tx.try_send(RespError::invalid_data("ERR client output buffer limit reached").into_response());
+                let err = RespError::invalid_data("ERR client output buffer limit reached");
+                hooks.on_protocol_error(&err);
+                let _ = resp_tx.try_send(err.into_response());
                 break;
             }
             read = read_more(&mut reader, &mut rd, cfg.read_timeout, cfg.idle_timeout) => {
@@ -399,11 +486,15 @@ where
                     if rd.is_empty() {
                         break;
                     }
-                    let _ = resp_tx.send(RespError::invalid_data("ERR unexpected EOF").into_response()).await;
+                    let err = RespError::invalid_data("ERR unexpected EOF");
+                    hooks.on_protocol_error(&err);
+                    let _ = resp_tx.send(err.into_response()).await;
                     break;
                 }
                 if rd.len() > cfg.max_frame_size {
-                    let _ = resp_tx.send(RespError::invalid_data("ERR max frame size exceeded").into_response()).await;
+                    let err = RespError::invalid_data("ERR max frame size exceeded");
+                    hooks.on_protocol_error(&err);
+                    let _ = resp_tx.send(err.into_response()).await;
                     break;
                 }
             }
