@@ -11,6 +11,7 @@ use crate::context::{
     ClientId, Cmd, Command, Extensions, LocalAddr, PeerAddr, PubSubHandle, PushHandle,
     RequestContext, State as AppState,
 };
+use crate::resp::Value;
 use crate::response::{IntoResponse, RespError, Response};
 
 /// Extract a typed value from a request context.
@@ -29,6 +30,8 @@ pub trait Handler<State>: Send + Sync + 'static {
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+type HandlerMarker5<T1, T2, T3, T4, T5> = fn(T1, T2, T3, T4, T5);
+type HandlerMarker6<T1, T2, T3, T4, T5, T6> = fn(T1, T2, T3, T4, T5, T6);
 
 pub trait IntoHandler<State, Args>: Send + Sync + 'static {
     fn into_handler(self) -> Arc<dyn Handler<State>>;
@@ -60,12 +63,12 @@ struct HandlerFn4<F, T1, T2, T3, T4> {
 
 struct HandlerFn5<F, T1, T2, T3, T4, T5> {
     f: Arc<F>,
-    _t: PhantomData<fn(T1, T2, T3, T4, T5)>,
+    _t: PhantomData<HandlerMarker5<T1, T2, T3, T4, T5>>,
 }
 
 struct HandlerFn6<F, T1, T2, T3, T4, T5, T6> {
     f: Arc<F>,
-    _t: PhantomData<fn(T1, T2, T3, T4, T5, T6)>,
+    _t: PhantomData<HandlerMarker6<T1, T2, T3, T4, T5, T6>>,
 }
 
 macro_rules! impl_handler {
@@ -79,19 +82,26 @@ macro_rules! impl_handler {
             $( $ty: FromRequest<State> + Send + 'static, )*
             State: Send + Sync + 'static,
         {
-            fn call(&self, mut ctx: RequestContext, state: Arc<State>) -> BoxFuture<Response> {
-                let f = Arc::clone(&self.f);
-                Box::pin(async move {
-                    $(
-                        let $ty = match $ty::from_request(&mut ctx, &state).await {
-                            Ok(value) => value,
-                            Err(rejection) => return rejection.into_response(),
-                        };
-                    )*
+    fn call(&self, mut ctx: RequestContext, state: Arc<State>) -> BoxFuture<Response> {
+        let f = Arc::clone(&self.f);
+        Box::pin(async move {
+            log_handler_start(&ctx);
+            $(
+                let $ty = match $ty::from_request(&mut ctx, &state).await {
+                    Ok(value) => value,
+                    Err(rejection) => {
+                        let response = rejection.into_response();
+                        log_handler_result(&ctx, &response);
+                        return response;
+                    }
+                };
+            )*
 
-                    f($( $ty ),*).await.into_response()
-                })
-            }
+            let response = f($( $ty ),*).await.into_response();
+            log_handler_result(&ctx, &response);
+            response
+        })
+    }
         }
     };
 }
@@ -103,9 +113,14 @@ where
     R: IntoResponse,
     State: Send + Sync + 'static,
 {
-    fn call(&self, _ctx: RequestContext, _state: Arc<State>) -> BoxFuture<Response> {
+    fn call(&self, ctx: RequestContext, _state: Arc<State>) -> BoxFuture<Response> {
         let f = Arc::clone(&self.f);
-        Box::pin(async move { f().await.into_response() })
+        Box::pin(async move {
+            log_handler_start(&ctx);
+            let response = f().await.into_response();
+            log_handler_result(&ctx, &response);
+            response
+        })
     }
 }
 
@@ -218,8 +233,7 @@ where
     }
 }
 
-impl<State, F, Fut, R, T1, T2, T3, T4, T5, T6> IntoHandler<State, (T1, T2, T3, T4, T5, T6)>
-    for F
+impl<State, F, Fut, R, T1, T2, T3, T4, T5, T6> IntoHandler<State, (T1, T2, T3, T4, T5, T6)> for F
 where
     F: Send + Sync + 'static + Fn(T1, T2, T3, T4, T5, T6) -> Fut,
     Fut: Future<Output = R> + Send + 'static,
@@ -250,6 +264,15 @@ impl<State> Clone for Router<State> {
         Self {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+impl<State> Default for Router<State>
+where
+    State: Default + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -357,6 +380,10 @@ fn normalize_command_key(command: &str) -> Bytes {
 }
 
 fn display_command_name(bytes: &Bytes) -> String {
+    display_bytes(bytes)
+}
+
+fn display_bytes(bytes: &Bytes) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_owned(),
         Err(_) => format!("0x{}", hex_bytes(bytes)),
@@ -371,6 +398,36 @@ fn hex_bytes(bytes: &Bytes) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+fn log_handler_start(ctx: &RequestContext) {
+    if log::log_enabled!(log::Level::Debug) {
+        let name = display_command_name(&ctx.command.name_upper);
+        log::debug!(
+            target: "handler",
+            "start id={} cmd={} args={}",
+            ctx.client_id,
+            name,
+            ctx.command.args.len()
+        );
+    }
+}
+
+fn log_handler_result(ctx: &RequestContext, response: &Response) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    if let Value::Error(msg) = response {
+        let name = display_command_name(&ctx.command.name_upper);
+        let detail = display_bytes(msg);
+        log::debug!(
+            target: "handler",
+            "error id={} cmd={} msg={}",
+            ctx.client_id,
+            name,
+            detail
+        );
+    }
 }
 
 impl<State> FromRequest<State> for Cmd

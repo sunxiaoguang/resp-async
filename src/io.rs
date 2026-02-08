@@ -313,7 +313,7 @@ fn bind_with_backlog(addr: &str, backlog: u32) -> Result<TcpListener> {
     let backlog = backlog.max(1).min(i32::MAX as u32) as i32;
     socket.listen(backlog)?;
     let listener: std::net::TcpListener = socket.into();
-    Ok(TcpListener::from_std(listener)?)
+    TcpListener::from_std(listener)
 }
 
 async fn run_server<State>(

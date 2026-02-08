@@ -186,7 +186,7 @@ impl From<Value> for Vec<Value> {
 impl From<&Value> for Vec<Value> {
     fn from(val: &Value) -> Self {
         if let Value::Array(array) = val {
-            array.iter().cloned().collect()
+            array.to_vec()
         } else {
             Vec::from(val)
         }
